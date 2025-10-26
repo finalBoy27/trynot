@@ -35,7 +35,8 @@ def health():
 def webhook():
     try:
         update_dict = request.get_json()
-        bot.process_update(update_dict)
+        update = Update.from_dict(update_dict)
+        asyncio.run(bot.handle_update(update))
         return 'OK', 200
     except Exception as e:
         print(f"Webhook error: {e}")
