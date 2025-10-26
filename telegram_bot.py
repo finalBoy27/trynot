@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from io import BytesIO
 from pyrogram import Client, filters
-from pyrogram.types import Update
+from pyrogram.types import Update, Message
 from flask import request
 from io import BytesIO
 import threading
