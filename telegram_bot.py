@@ -18,7 +18,9 @@ from datetime import datetime
 from pathlib import Path
 from io import BytesIO
 from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram.types import Update
+from flask import request
+from io import BytesIO
 import threading
 from flask import Flask
 
@@ -28,6 +30,16 @@ app = Flask(__name__)
 @app.route('/health')
 def health():
     return 'OK'
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    try:
+        update = Update.read(BytesIO(request.get_data()))
+        bot.process_update(update)
+        return 'OK', 200
+    except Exception as e:
+        print(f"Webhook error: {e}")
+        return 'Error', 500
 
 def run_flask():
     app.run(host='0.0.0.0', port=int(os.getenv("PORT", 8080)))
@@ -1149,8 +1161,21 @@ async def handle_message(client: Client, message: Message):
 # ───────────────────────────────
 if __name__ == "__main__":
     if WEBHOOK_URL:
-        bot.start()
-        bot.set_webhook(WEBHOOK_URL)
-        bot.idle()
+        # Set webhook via Telegram API
+        import asyncio
+        async def set_webhook():
+            async with httpx.AsyncClient() as client:
+                url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
+                data = {"url": WEBHOOK_URL}
+                resp = await client.post(url, data=data)
+                if resp.status_code == 200:
+                    print(f"Webhook set to: {WEBHOOK_URL}")
+                else:
+                    print(f"Failed to set webhook: {resp.text}")
+        asyncio.run(set_webhook())
+        # Keep the app running for webhooks
+        import time
+        while True:
+            time.sleep(1)
     else:
         bot.run()
