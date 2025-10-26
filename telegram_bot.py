@@ -34,8 +34,8 @@ def health():
 @app.route('/webhook', methods=['POST'])
 def webhook():
     try:
-        update = Update.read(BytesIO(request.get_data()))
-        bot.process_update(update)
+        update_dict = request.get_json()
+        bot.process_update(update_dict)
         return 'OK', 200
     except Exception as e:
         print(f"Webhook error: {e}")
