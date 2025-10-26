@@ -18,34 +18,21 @@ from datetime import datetime
 from pathlib import Path
 from io import BytesIO
 from pyrogram import Client, filters
-from pyrogram.types import Message
-from flask import request, Flask
+from pyrogram.types import Update, Message
+from flask import Flask
 import threading
 
-# ───────────────────────────────
-# FLASK SETUP
-# ───────────────────────────────
+# Health check app
 app = Flask(__name__)
-webhook_queue = asyncio.Queue()
 
 @app.route('/health')
 def health():
-    return 'OK', 200
-
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    try:
-        update_dict = request.get_json()
-        if update_dict:
-            # Just acknowledge receipt, don't process here
-            return 'OK', 200
-        return 'Invalid JSON', 400
-    except Exception as e:
-        print(f"Webhook error: {e}")
-        return 'Error', 500
+    return 'OK'
 
 def run_flask():
-    app.run(host='0.0.0.0', port=int(os.getenv("PORT", 8080)), debug=False, use_reloader=False)
+    app.run(host='0.0.0.0', port=int(os.getenv("PORT", 8080)))
+
+threading.Thread(target=run_flask, daemon=True).start()
 
 # ───────────────────────────────
 # ⚙️ CONFIG
@@ -67,11 +54,13 @@ RETRY_DELAY = 1.5
 VALID_EXTS = ["jpg", "jpeg", "png", "gif", "webp", "mp4", "mov", "avi", "mkv", "webm"]
 EXCLUDE_PATTERNS = ["/data/avatars/", "/data/assets/", "/data/addonflare/"]
 
+# HTML Gallery Config
 OUTPUT_FILE = "Scraping/final_full_gallery.html"
 HTML_DIR = "Scraping/Html"
 MAX_FILE_SIZE_MB = 100
 MAX_PAGINATION_RANGE = 100
 
+# Upload Config
 UPLOAD_FILE = "Scraping/final_full_gallery.html"
 MAX_MB = 100
 HOSTS = [
@@ -80,17 +69,15 @@ HOSTS = [
     {"name":"Catbox","url":"https://catbox.moe/user/api.php","field":"fileToUpload","data":{"reqtype":"fileupload"}}
 ]
 
-API_ID = int(os.getenv("API_ID", "24536446"))
+API_ID = int(os.getenv("API_ID", 24536446))  # 👈 Replace 123456 with your actual API_ID
 API_HASH = os.getenv("API_HASH", "baee9dd189e1fd1daf0fb7239f7ae704")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "7380785361:AAF4aYR8AAfUvx4zPr8seiZJWoM9ns1kl4s")
 
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN environment variable not set")
-
-# Initialize Pyrogram client
 bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
+# ───────────────────────────────
+# 🌟 RICH CONSOLE SETUP
+# ───────────────────────────────
 console = Console()
 
 # ───────────────────────────────
@@ -297,6 +284,13 @@ async def process_thread(client: httpx.AsyncClient, post_url, patterns, semaphor
         
         return [a for a in matched if a["matched"]] or matched
 
+async def process_threads_concurrent(thread_urls, patterns):
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
+    async with httpx.AsyncClient() as client:
+        tasks = [process_thread(client, url, patterns, semaphore) for url in thread_urls]
+        results = await asyncio.gather(*tasks)
+    return [item for sublist in results for item in sublist]
+
 # ───────────────────────────────
 # 🎬 MEDIA EXTRACTION
 # ───────────────────────────────
@@ -421,15 +415,452 @@ async def process_articles_batch(batch_num, articles_file, media_dir):
     console.print(f"[yellow]⚠ No media:[/yellow] {len(no_media_posts)} posts\n")
 
 # ───────────────────────────────
-# 📄 HTML GENERATOR (TRUNCATED - use original)
+# 📄 HTML GENERATOR
 # ───────────────────────────────
 def create_html(media_by_date_per_username, usernames, start_year, end_year):
-    # Use your existing create_html function here
-    # (kept from original code)
-    return "<html><!-- HTML content --></html>"
+    usernames_str = ", ".join(usernames)
+    title = f"{usernames_str} - Media Gallery"
+    console.print(f"Generating HTML for usernames: {usernames_str}")
+
+    # Prepare mediaData as a Python dictionary for JSON serialization
+    media_data = {}
+    total_items = 0
+    media_counts = {}
+    # Add type counts for all media
+    total_type_counts = {'images': 0, 'videos': 0, 'gifs': 0}
+    
+    for username in usernames:
+        media_by_date = media_by_date_per_username[username]
+        media_list = []
+        count = 0
+        user_type_counts = {'images': 0, 'videos': 0, 'gifs': 0}
+        
+        for media_type in ['images', 'videos', 'gifs']:
+            for date in sorted(media_by_date[media_type].keys(), reverse=True):
+                for item in media_by_date[media_type][date]:
+                    if not item.startswith(('http://', 'https://')):
+                        console.print(f"Skipping invalid URL for {username}: {item}")
+                        continue
+                    try:
+                        # Ensure URL is properly escaped
+                        safe_src = html.escape(item).replace('"', '\\"').replace('\n', '')
+                        media_list.append({
+                            'type': media_type,
+                            'src': safe_src,
+                            'date': date
+                        })
+                        count += 1
+                        user_type_counts[media_type] += 1
+                        total_type_counts[media_type] += 1
+                    except Exception as e:
+                        console.print(f"Failed to process media item for {username}: {item}, error: {str(e)}")
+                        continue
+
+        media_list = sorted(media_list, key=lambda x: x['date'], reverse=True)
+        safe_username = username.replace(' ', '_')
+        media_data[safe_username] = media_list
+        media_counts[username] = count
+        total_items += count
+
+    if total_items == 0:
+        console.print(f"No media items found for {usernames_str}")
+        return None
+
+    # Check HTML size to prevent truncation
+    estimated_size = sum(len(str(item)) for user_items in media_data.values() for item in user_items) / (1024 * 1024)
+    if estimated_size > MAX_FILE_SIZE_MB:
+        console.print(f"Estimated HTML size {estimated_size:.2f} MB exceeds limit of {MAX_FILE_SIZE_MB} MB")
+        return None
+
+    # Serialize mediaData to JSON to ensure valid structure
+    try:
+        media_data_json = json.dumps(media_data, ensure_ascii=False, indent=2)
+    except Exception as e:
+        console.print(f"Failed to serialize mediaData to JSON: {str(e)}")
+        return None
+
+    # Calculate default itemsPerPage
+    default_items_per_page = max(1, math.ceil(total_items / MAX_PAGINATION_RANGE))
+
+    html_fragments = [f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>{html.escape(title)}</title>
+  <style>
+    body {{ background-color: #000; font-family: Arial, sans-serif; margin: 0; padding: 20px; color: white; }}
+    h1 {{ text-align: center; margin-bottom: 20px; font-size: 24px; }}
+    .button-container {{ text-align: center; margin-bottom: 20px; display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; }}
+    .filter-button {{ padding: 14px 26px; margin: 6px; font-size: 18px; border-radius: 8px; border: none; background-color: #333; color: white; cursor: pointer; transition: background-color 0.3s; }}
+    .filter-button:hover {{ background-color: #555; }}
+    .filter-button.active {{ background-color: #007bff; }}
+    .number-input {{ padding: 12px; font-size: 18px; width: 80px; border-radius: 8px; border: none; background-color: #333; color: white; }}
+    .media-type-select {{ padding: 12px; font-size: 18px; border-radius: 8px; border: none; background-color: #333; color: white; }}
+    .pagination {{ text-align: center; margin: 20px 0; }}
+    .pagination-button {{ padding: 14px 24px; margin: 0 6px; font-size: 18px; border-radius: 8px; border: none; background-color: #333; color: white; cursor: pointer; transition: background-color 0.3s, transform 0.2s; }}
+    .pagination-button:hover {{ background-color: #555; transform: scale(1.05); }}
+    .pagination-button.active {{ background-color: #007bff; font-weight: bold; border: 2px solid #0056b3; }}
+    .pagination-button:disabled {{ background-color: #555; cursor: not-allowed; opacity: 0.6; }}
+    .masonry {{ display: flex; justify-content: center; gap: 10px; min-height: 100px; }}
+    .column {{ flex: 1; display: flex; flex-direction: column; gap: 10px; }}
+    .column img, .column video {{ width: 100%; border-radius: 5px; display: block; }}
+    .column video {{ background-color: #111; }}
+    .column video[title*="Video file"] {{ 
+      position: relative; 
+      cursor: pointer;
+    }}
+    .column video[title*="Video file"]::after {{ 
+      content: "🎬"; 
+      position: absolute; 
+      top: 5px; 
+      right: 5px; 
+      background-color: rgba(0,0,0,0.7); 
+      color: white; 
+      padding: 2px 5px; 
+      border-radius: 3px; 
+      font-size: 12px;
+    }}
+    @media (max-width: 768px) {{ 
+      .masonry {{ flex-direction: column; }} 
+      .filter-button {{ padding: 8px 15px; font-size: 14px; }} 
+      .number-input, .media-type-select {{ width: 100px; font-size: 14px; }} 
+      .pagination-button {{ padding: 6px 10px; font-size: 12px; }}
+    }}
+  </style>
+</head>
+<body>
+  <div class="button-container">
+    <select id="mediaType" class="media-type-select">
+      <option value="all" selected>All ({total_items})</option>
+      <option value="images">Images ({total_type_counts['images']})</option>
+      <option value="videos">Videos ({total_type_counts['videos']})</option>
+      <option value="gifs">Gifs ({total_type_counts['gifs']})</option>
+    </select>
+    <div id="itemsPerUserContainer">
+      <input type="number" id="itemsPerUser" class="number-input" min="1" value="2" placeholder="Items per user">
+    </div>
+    <input type="number" id="itemsPerPage" class="number-input" min="1" value="{default_items_per_page}" placeholder="Items per page">
+    <button class="filter-button active" data-usernames="" data-original-text="All">All ({total_items})</button>
+    {"".join(
+    f'<button class="filter-button" data-usernames="{html.escape(username.replace(" ", "_"))}" '
+    f'data-original-text="{html.escape(username)} ({media_counts[username]})">'
+    f'{html.escape(username)} ({media_counts[username]})</button>'
+    for username in usernames)}
+  </div>
+  <div class="pagination" id="pagination"></div>
+  <div class="masonry" id="masonry"></div>
+  <script>
+    const mediaData = {media_data_json};
+    const usernames = {json.dumps([username.replace(' ', '_') for username in usernames])};
+    const masonry = document.getElementById("masonry");
+    const pagination = document.getElementById("pagination");
+    const buttons = document.querySelectorAll('.filter-button');
+    const mediaTypeSelect = document.getElementById('mediaType');
+    const itemsPerUserInput = document.getElementById('itemsPerUser');
+    const itemsPerPageInput = document.getElementById('itemsPerPage');
+    let selectedUsername = '';
+    window.currentPage = 1;
+
+    function updateButtonLabels() {{
+      buttons.forEach(button => {{
+        const originalText = button.getAttribute('data-original-text');
+        button.textContent = originalText;
+      }});
+    }}
+
+    function generateVideoThumbnail(videoElement) {{
+      videoElement.addEventListener('loadedmetadata', function handleLoadedMetadata() {{
+        try {{
+          videoElement.currentTime = 0.1;
+        }} catch (e) {{
+          console.error('Error setting currentTime:', e);
+        }}
+        videoElement.removeEventListener('loadedmetadata', handleLoadedMetadata);
+      }}, {{ once: true }});
+
+      videoElement.addEventListener('seeked', function handleSeeked() {{
+        try {{
+          const playPromise = videoElement.play();
+          if (playPromise !== undefined) {{
+            playPromise.then(() => {{
+              setTimeout(() => {{
+                videoElement.pause();
+              }}, 100);
+            }}).catch(e => {{
+              console.error('Play error:', e);
+              videoElement.pause();
+            }});
+          }} else {{
+            videoElement.play();
+            setTimeout(() => {{
+              videoElement.pause();
+            }}, 100);
+          }}
+        }} catch (e) {{
+          console.error('Error in play/pause:', e);
+        }}
+        videoElement.removeEventListener('seeked', handleSeeked);
+      }}, {{ once: true }});
+    }}
+
+    function getOrderedMedia(mediaType, itemsPerUser, itemsPerPage, page) {{
+      try {{
+        let allMedia = [];
+        if (selectedUsername === '') {{
+          let maxRounds = 0;
+          const mediaByUser = {{}};
+          usernames.forEach(username => {{
+            let userMedia = mediaData[username] || [];
+            if (mediaType !== 'all') {{
+              userMedia = userMedia.filter(item => item.type === mediaType);
+            }}
+            userMedia = userMedia.sort((a, b) => new Date(b.date) - new Date(a.date));
+            mediaByUser[username] = userMedia;
+            maxRounds = Math.max(maxRounds, Math.ceil(userMedia.length / itemsPerUser));
+          }});
+          for (let round = 0; round < maxRounds; round++) {{
+            usernames.forEach(username => {{
+              const start = round * itemsPerUser;
+              const end = start + itemsPerUser;
+              allMedia = allMedia.concat(mediaByUser[username].slice(start, end));
+            }});
+          }}
+          allMedia = allMedia.filter(item => item);
+        }} else {{
+          let userMedia = mediaData[selectedUsername] || [];
+          if (mediaType !== 'all') {{
+            userMedia = userMedia.filter(item => item.type === mediaType);
+          }}
+          allMedia = userMedia.sort((a, b) => new Date(b.date) - new Date(a.date));
+        }}
+        const start = (page - 1) * itemsPerPage;
+        const end = start + itemsPerPage;
+        console.log('getOrderedMedia:', {{ mediaType, itemsPerUser, itemsPerPage, page, start, end, total: allMedia.length }});
+        return {{ media: allMedia.slice(start, end), total: allMedia.length }};
+      }} catch (e) {{
+        console.error('Error in getOrderedMedia:', e);
+        return {{ media: [], total: 0 }};
+      }}
+    }}
+
+    function updatePagination(totalItems, itemsPerPage, currentPage) {{
+      try {{
+        pagination.innerHTML = '';
+        const totalPages = Math.ceil(totalItems / itemsPerPage);
+        if (totalPages <= 1) {{
+          console.log('updatePagination: Only one page, no pagination needed');
+          return;
+        }}
+
+        console.log('updatePagination:', {{ totalItems, itemsPerPage, currentPage: window.currentPage, totalPages }});
+
+        const maxButtons = 5;
+        let startPage = Math.max(1, window.currentPage - Math.floor(maxButtons / 2));
+        let endPage = Math.min(totalPages, startPage + maxButtons - 1);
+        if (endPage - startPage + 1 < maxButtons) {{
+          startPage = Math.max(1, endPage - maxButtons + 1);
+        }}
+
+        const prevButton = document.createElement('button');
+        prevButton.className = 'pagination-button';
+        prevButton.textContent = 'Previous';
+        prevButton.disabled = window.currentPage === 1;
+        prevButton.addEventListener('click', () => {{
+          if (window.currentPage > 1) {{
+            window.currentPage--;
+            console.log('Previous button clicked, new currentPage:', window.currentPage);
+            renderMedia();
+          }}
+        }});
+        pagination.appendChild(prevButton);
+
+        for (let i = startPage; i <= endPage; i++) {{
+          const pageButton = document.createElement('button');
+          pageButton.className = 'pagination-button' + (i === window.currentPage ? ' active' : '');
+          pageButton.textContent = i;
+          pageButton.addEventListener('click', (function(pageNumber) {{
+            return function() {{
+              window.currentPage = pageNumber;
+              console.log('Page button clicked, new currentPage:', window.currentPage);
+              renderMedia();
+            }};
+          }})(i));
+          pagination.appendChild(pageButton);
+        }}
+
+        const nextButton = document.createElement('button');
+        nextButton.className = 'pagination-button';
+        nextButton.textContent = 'Next';
+        nextButton.disabled = window.currentPage === totalPages;
+        nextButton.addEventListener('click', () => {{
+          if (window.currentPage < totalPages) {{
+            window.currentPage++;
+            console.log('Next button clicked, new currentPage:', window.currentPage);
+            renderMedia();
+          }}
+        }});
+        pagination.appendChild(nextButton);
+      }} catch (e) {{
+        console.error('Error in updatePagination:', e);
+      }}
+    }}
+
+    function renderMedia() {{
+      try {{
+        masonry.innerHTML = '';
+        const mediaType = mediaTypeSelect.value;
+        const itemsPerUser = parseInt(itemsPerUserInput.value) || 2;
+        const itemsPerPage = parseInt(itemsPerPageInput.value) || {default_items_per_page};
+        const result = getOrderedMedia(mediaType, itemsPerUser, itemsPerPage, window.currentPage);
+        const allMedia = result.media;
+        const totalItems = result.total;
+        console.log('renderMedia:', {{ mediaType, itemsPerUser, itemsPerPage, currentPage: window.currentPage, mediaCount: allMedia.length, totalItems }});
+        updatePagination(totalItems, itemsPerPage, window.currentPage);
+
+        const columnsCount = 3;
+        const columns = [];
+        for (let i = 0; i < columnsCount; i++) {{
+          const col = document.createElement("div");
+          col.className = "column";
+          masonry.appendChild(col);
+          columns.push(col);
+        }}
+
+        const totalRows = Math.ceil(allMedia.length / columnsCount);
+        for (let row = 0; row < totalRows; row++) {{
+          for (let col = 0; col < columnsCount; col++) {{
+            const actualCol = row % 2 === 0 ? col : columnsCount - 1 - col;
+            const index = row * columnsCount + col;
+            if (index < allMedia.length) {{
+              let element;
+              if (allMedia[index].type === "videos") {{
+                element = document.createElement("video");
+                element.src = allMedia[index].src;
+                element.controls = true;
+                element.alt = "Video";
+                element.loading = "lazy";
+                element.preload = "metadata";
+                element.playsInline = true;
+                element.onerror = () => {{
+                  console.error('Failed to load video:', allMedia[index].src);
+                  element.remove();
+                }};
+                element.addEventListener('loadedmetadata', () => {{
+                  generateVideoThumbnail(element);
+                }}, {{ once: true }});
+              }} else {{
+                element = document.createElement("img");
+                element.src = allMedia[index].src;
+                element.alt = allMedia[index].type.charAt(0).toUpperCase() + allMedia[index].type.slice(1);
+                element.loading = "lazy";
+                element.onerror = () => {{
+                  console.error('Failed to load image:', allMedia[index].src);
+                  element.remove();
+                }};
+              }}
+              columns[actualCol].appendChild(element);
+            }}
+          }}
+        }}
+        window.scrollTo({{ top: 0, behavior: "smooth" }});
+      }} catch (e) {{
+        console.error('Error in renderMedia:', e);
+        masonry.innerHTML = '<p style="color: red;">Error loading media. Please check console for details.</p>';
+      }}
+    }}
+
+    buttons.forEach(button => {{
+      button.addEventListener('click', () => {{
+        try {{
+          const username = button.getAttribute('data-usernames');
+          if (button.classList.contains('active')) {{
+            return;
+          }}
+          buttons.forEach(btn => btn.classList.remove('active'));
+          button.classList.add('active');
+          selectedUsername = username;
+          window.currentPage = 1;
+          console.log('Filter button clicked, selectedUsername:', username, 'currentPage:', window.currentPage);
+          updateButtonLabels();
+          renderMedia();
+        }} catch (e) {{
+          console.error('Error in button click handler:', e);
+        }}
+      }});
+    }});
+
+    mediaTypeSelect.addEventListener('change', () => {{
+      try {{
+        window.currentPage = 1;
+        console.log('Media type changed, resetting currentPage to 1');
+        renderMedia();
+      }} catch (e) {{
+        console.error('Error in mediaTypeSelect change handler:', e);
+      }}
+    }});
+
+    itemsPerUserInput.addEventListener('input', () => {{
+      try {{
+        window.currentPage = 1;
+        console.log('Items per user changed, resetting currentPage to 1');
+        renderMedia();
+      }} catch (e) {{
+        console.error('Error in itemsPerUserInput input handler:', e);
+      }}
+    }});
+
+    itemsPerPageInput.addEventListener('input', () => {{
+      try {{
+        window.currentPage = 1;
+        console.log('Items per page changed, resetting currentPage to 1');
+        renderMedia();
+      }} catch (e) {{
+        console.error('Error in itemsPerPageInput input handler:', e);
+      }}
+    }});
+
+    document.addEventListener('play', function(e) {{
+      const videos = document.querySelectorAll("video");
+      videos.forEach(video => {{
+        if (video !== e.target) {{
+          video.pause();
+        }}
+      }});
+    }}, true);
+
+    try {{
+      updateButtonLabels();
+      renderMedia();
+    }} catch (e) {{
+      console.error('Initial render failed:', e);
+      masonry.innerHTML = '<p style="color: red;">Error loading media. Please check console for details.</p>';
+    }}
+  </script>
+</body>
+</html>"""]
+    
+
+    html_content = "".join(html_fragments)
+    console.print(f"Generated HTML with {total_items} items, size: {len(html_content) / (1024 * 1024):.2f} MB")
+    
+    # Clean up temporary data to free memory
+    try:
+        html_fragments.clear()
+        del html_fragments
+        media_data.clear()
+        del media_data
+        media_counts.clear()
+        del media_counts
+        gc.collect()  # Force garbage collection after HTML generation
+        console.print("✅ Memory cleaned up after HTML generation")
+    except Exception as cleanup_error:
+        console.print(f"Error during HTML generation cleanup: {str(cleanup_error)}")
+        gc.collect()  # Still attempt garbage collection
+    
+    return html_content
 
 # ───────────────────────────────
-# 📤 UPLOAD FUNCTIONS
+# � UPLOAD FUNCTIONS
 # ───────────────────────────────
 async def upload_file(client, host, data):
     buf = BytesIO(data)
@@ -455,7 +886,162 @@ async def upload_file(client, host, data):
         return (host["name"], f"Exception: {e}")
 
 # ───────────────────────────────
-# 🤖 BOT HANDLER - ONLY POLLING MODE
+# PROGRESS BAR
+# ───────────────────────────────
+def generate_bar(percentage):
+    filled = int(percentage / 10)
+    empty = 10 - filled
+    return "●" * filled + "○" * (empty // 2) + "◌" * (empty - empty // 2)
+
+# ───────────────────────────────
+# PROCESS USER
+# ───────────────────────────────
+async def process_user(user, title_only, user_idx, total_users, progress_msg, last_edit):
+    console.print(f"🔍 Processing user: {user}")
+    
+    search_display = "+".join(user.split())
+    tokens = [t for t in re.split(r"[,\s]+", user) if t]
+    phrase = " ".join(tokens)
+    PATTERNS = []
+    if phrase:
+        PATTERNS.append(re.compile(r"\b" + re.escape(phrase) + r"\b", re.IGNORECASE))
+    for tok in tokens:
+        PATTERNS.append(re.compile(r"\b" + re.escape(tok) + r"\b", re.IGNORECASE))
+    
+    user_safe = user.replace(' ', '_')
+    THREADS_DIR = f"Scraping/{user_safe}/Threads"
+    ARTICLES_DIR = f"Scraping/{user_safe}/Articles"
+    MEDIA_DIR = f"Scraping/{user_safe}/Media"
+    
+    os.makedirs(ARTICLES_DIR, exist_ok=True)
+    os.makedirs(MEDIA_DIR, exist_ok=True)
+    
+    # Update progress: start
+    progress = (user_idx / total_users) * 100
+    bar = generate_bar(progress)
+    msg = f"completed {user_idx}/{total_users}\n{bar} {progress:.2f}%\nprocess current username: {user}"
+    now = time.time()
+    if now - last_edit[0] > 3:
+        await progress_msg.edit(msg)
+        last_edit[0] = now
+    
+    # Phase 1: Collect threads
+    await collect_threads(search_display, title_only, THREADS_DIR)
+    
+    # Update progress
+    progress += 20 / total_users
+    bar = generate_bar(progress)
+    msg = f"completed {user_idx}/{total_users}\n{bar} {progress:.2f}%\nprocess current username: {user} - threads collected"
+    now = time.time()
+    if now - last_edit[0] > 3:
+        await progress_msg.edit(msg)
+        last_edit[0] = now
+    
+    # Phase 2: Process batches
+    batch_files = sorted([f for f in os.listdir(THREADS_DIR) if f.endswith(".json")])
+    
+    for idx, batch_file in enumerate(batch_files, 1):
+        with open(os.path.join(THREADS_DIR, batch_file), "r", encoding="utf-8") as f:
+            threads_data = json.load(f)
+
+        all_threads = []
+        for page_key in sorted(threads_data.keys(), key=lambda x: int(x.split("_")[1])):
+            all_threads.extend(threads_data[page_key])
+
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
+        async with httpx.AsyncClient() as client:
+            tasks = [process_thread(client, url, PATTERNS, semaphore) for url in all_threads]
+            results = await asyncio.gather(*tasks)
+        
+        all_articles = [item for sublist in results for item in sublist]
+        articles_output = os.path.join(ARTICLES_DIR, f"batch_{idx:02d}_desifakes_articles.json")
+        with open(articles_output, "w", encoding="utf-8") as f:
+            json.dump(all_articles, f, indent=2, ensure_ascii=False)
+        
+        await process_articles_batch(idx, articles_output, MEDIA_DIR)
+    
+    # Update progress
+    progress += 30 / total_users
+    bar = generate_bar(progress)
+    msg = f"completed {user_idx}/{total_users}\n{bar} {progress:.2f}%\nprocess current username: {user} - media extracted"
+    now = time.time()
+    if now - last_edit[0] > 3:
+        await progress_msg.edit(msg)
+        last_edit[0] = now
+    
+    # Collect user data
+    media_files = sorted([f for f in os.listdir(MEDIA_DIR) if f.startswith("batch_") and f.endswith("_desifakes_media.json")])
+    user_data = []
+    for mf in media_files:
+        with open(os.path.join(MEDIA_DIR, mf), "r", encoding="utf-8") as f:
+            data = json.load(f)
+            for entry in data:
+                entry["username"] = user
+                user_data.append(entry)
+    
+    # Deduplicate for individual
+    seen_urls = set()
+    for entry in user_data:
+        new_media = []
+        for url in entry.get("media", []):
+            if url not in seen_urls:
+                seen_urls.add(url)
+                new_media.append(url)
+        entry["media"] = new_media
+    
+    # Generate individual HTML
+    os.makedirs(HTML_DIR, exist_ok=True)
+    individual_output = os.path.join(HTML_DIR, f"{user_idx+1:02d}_{user_safe}.html")
+    
+    media_by_date = {"images": {}, "videos": {}, "gifs": {}}
+    for entry in user_data:
+        date = entry.get("post_date", "")
+        if not date:
+            continue
+        for url in entry.get("media", []):
+            if 'vh/dl?url' in url:
+                typ = 'videos'
+            elif 'vh/dli?' in url:
+                typ = 'images'
+            else:
+                if '.mp4' in url.lower():
+                    typ = 'videos'
+                elif '.gif' in url.lower():
+                    typ = 'gifs'
+                else:
+                    typ = 'images'
+            if date not in media_by_date[typ]:
+                media_by_date[typ][date] = []
+            media_by_date[typ][date].append(url)
+    
+    media_by_date_per_username = {user: media_by_date}
+    html_content = create_html(media_by_date_per_username, [user], 2019, 2025)
+    
+    if html_content:
+        with open(individual_output, "w", encoding="utf-8") as f:
+            f.write(html_content)
+    
+    # Update progress
+    progress += 20 / total_users
+    bar = generate_bar(progress)
+    msg = f"completed {user_idx}/{total_users}\n{bar} {progress:.2f}%\nprocess current username: {user} - HTML generated"
+    now = time.time()
+    if now - last_edit[0] > 3:
+        await progress_msg.edit(msg)
+        last_edit[0] = now
+    
+    # Clean up for this user
+    try:
+        shutil.rmtree(THREADS_DIR)
+        shutil.rmtree(ARTICLES_DIR)
+        shutil.rmtree(MEDIA_DIR)
+    except:
+        pass
+    
+    return user_data
+
+# ───────────────────────────────
+# BOT HANDLER
 # ───────────────────────────────
 @bot.on_message(filters.text & filters.private)
 async def handle_message(client: Client, message: Message):
@@ -472,25 +1058,94 @@ async def handle_message(client: Client, message: Message):
         await message.reply("No usernames provided")
         return
     
-    await message.reply(f"Starting scraping for: {', '.join(usernames)}")
-    # Your processing logic here
-
-# ───────────────────────────────
-# MAIN ENTRY POINT
-# ───────────────────────────────
-async def main():
-    # Start Flask in a thread
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    console.print("[green]✓ Flask server started[/green]")
+    total_users = len(usernames)
+    all_data = []
+    last_edit = [0]
     
-    # Start Pyrogram bot in polling mode
-    async with bot:
-        console.print("[green]✓ Bot started in polling mode[/green]")
-        await bot.idle()
+    # Send initial progress message
+    progress_msg = await message.reply("Starting processing...")
+    
+    for user_idx, user in enumerate(usernames):
+        user_data = await process_user(user, title_only, user_idx, total_users, progress_msg, last_edit)
+        all_data.extend(user_data)
+    
+    # Final progress
+    progress = 100
+    bar = generate_bar(progress)
+    msg = f"completed {total_users}/{total_users}\n{bar} {progress:.2f}%\nGenerating final gallery..."
+    await progress_msg.edit(msg)
+    
+    # Generate final
+    media_by_date_per_username = {u: {"images": {}, "videos": {}, "gifs": {}} for u in usernames}
+    
+    seen_urls = set()
+    for entry in all_data:
+        user = entry["username"]
+        date = entry.get("post_date", "")
+        if not date:
+            continue
+        for url in entry.get("media", []):
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            if 'vh/dl?url' in url:
+                typ = 'videos'
+            elif 'vh/dli?' in url:
+                typ = 'images'
+            else:
+                if '.mp4' in url.lower():
+                    typ = 'videos'
+                elif '.gif' in url.lower():
+                    typ = 'gifs'
+                else:
+                    typ = 'images'
+            if date not in media_by_date_per_username[user][typ]:
+                media_by_date_per_username[user][typ][date] = []
+            media_by_date_per_username[user][typ][date].append(url)
+    
+    html_content = create_html(media_by_date_per_username, usernames, 2019, 2025)
+    
+    total_items = sum(len(media_list) for user_media in media_by_date_per_username.values() for media_type in user_media.values() for media_list in media_type.values())
+    
+    if html_content:
+        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+            f.write(html_content)
+        
+        # Upload
+        with open(OUTPUT_FILE, "rb") as f:
+            data = f.read()
+        async with httpx.AsyncClient() as client:
+            tasks = [upload_file(client, h, data) for h in HOSTS]
+            results = await asyncio.gather(*tasks)
+        
+        links = []
+        for name, res in results:
+            status = "✅" if res.startswith("https://") else "❌"
+            links.append(f"{status} {name}: {res}")
+        
+        caption = f"Total Media in Html: {total_items}\n───────────────────────────────────\n📤 Uploading Final HTML to Hosting Services\n" + "\n".join(links)
+        
+        await message.reply_document(OUTPUT_FILE, caption=caption)
+        
+        # Delete progress message after sending the final gallery
+        await progress_msg.delete()
+        
+        # Clean up
+        try:
+            for item in os.listdir("Scraping"):
+                path = os.path.join("Scraping", item)
+                if os.path.isdir(path):
+                    shutil.rmtree(path)
+                elif os.path.isfile(path) and path.endswith(".json"):
+                    os.remove(path)
+        except:
+            pass
+    else:
+        await message.reply("Failed to generate HTML")
 
+# ───────────────────────────────
+# MAIN
+# ───────────────────────────────
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        console.print("[yellow]Bot stopped[/yellow]")
+    threading.Thread(target=run_flask, daemon=True).start()
+    bot.run()
