@@ -84,7 +84,7 @@ HOSTS = [
 
 API_ID = int(os.getenv("API_ID", 24536446))  # 👈 Replace 123456 with your actual API_ID
 API_HASH = os.getenv("API_HASH", "baee9dd189e1fd1daf0fb7239f7ae704")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "7380785361:AAFWZYUo3CdEhb2R4-rJ9jEikVbwYMn8grk")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "7380785361:AAF4aYR8AAfUvx4zPr8seiZJWoM9ns1kl4s")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", None)
 
 bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
