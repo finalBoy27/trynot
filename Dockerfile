@@ -25,4 +25,4 @@ COPY . .
 EXPOSE 8080
 
 # Start the bot
-CMD ["python", "telegram_bot.py"]
+CMD ["python", "telegram_bot1.py"]
