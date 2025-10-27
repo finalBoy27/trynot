@@ -8,28 +8,27 @@ import html
 import math
 import gc
 from urllib.parse import urlencode, urljoin
-from selectolax.parser import HTMLParser
+from selectolax.lexbor import LexborHTMLParser
 from loguru import logger
-from datetime import datetime
 from pathlib import Path
 from io import BytesIO
 from pyrogram import Client, filters
 from pyrogram.types import Update, Message
-from flask import Flask
+from fastapi import FastAPI
+import uvicorn
 import threading
 from aioshutil import rmtree
+import pendulum
 
 # Health check app
-app = Flask(__name__)
+app = FastAPI()
 
-@app.route('/health')
+@app.get('/health')
 def health():
     return 'OK'
 
-def run_flask():
-    app.run(host='0.0.0.0', port=int(os.getenv("PORT", 8080)))
-
-threading.Thread(target=run_flask, daemon=True).start()
+def run_fastapi():
+    uvicorn.run(app, host='0.0.0.0', port=int(os.getenv("PORT", 8080)))
 
 # ───────────────────────────────
 # ⚙️ CONFIG
@@ -68,14 +67,15 @@ HOSTS = [
 
 API_ID = int(os.getenv("API_ID", 24536446))  # 👈 Replace 123456 with your actual API_ID
 API_HASH = os.getenv("API_HASH", "baee9dd189e1fd1daf0fb7239f7ae704")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "7380785361:AAEYAi-qJNF3bKu0AlihcBCRvkyF3g3Z5y0")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "7564190075:AAFO-mUYHNbf_aoMZRyAL372xhGP0f371dk")
 
 bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # ───────────────────────────────
 # 🌟 LOGURU SETUP
 # ───────────────────────────────
-logger.add(lambda msg: print(msg, end=""), level="INFO")
+logger.remove()  # Remove default handler
+logger.add(lambda msg: print(msg, end="", flush=True), level="INFO", format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {name}:{function}:{line} - {message}")
 
 # ───────────────────────────────
 # 🧩 UTILITIES
@@ -99,37 +99,49 @@ def build_search_url(search_id, query, newer_than, older_than, page=None, older_
     return f"{base_url}?{urlencode(params)}"
 
 def find_view_older_link(html_str: str, title_only: int = 0):
-    tree = HTMLParser(html_str)
-    link_node = tree.css_first("div.block-footer a")
-    if not link_node or not link_node.attributes.get("href"):
-        return None
-    href = link_node.attributes["href"]
-    match = re.search(r"/search/(\d+)/older.*?before=(\d+).*?[&?]q=([^&]+)", href)
-    if not match:
-        return None
-    sid, before, q = match.groups()
-    if title_only == 1:
-        return f"{BASE_URL}/search/{sid}/?q={q}&c[older_than]={before}&o=date&c[title_only]=1"
-    return f"{BASE_URL}/search/{sid}/?q={q}&c[older_than]={before}&o=date"
+    tree = LexborHTMLParser(html_str)
+    try:
+        link_node = tree.css_first("div.block-footer a")
+        if not link_node or not link_node.attributes.get("href"):
+            return None
+        href = link_node.attributes["href"]
+        match = re.search(r"/search/(\d+)/older.*?before=(\d+).*?[&?]q=([^&]+)", href)
+        if not match:
+            return None
+        sid, before, q = match.groups()
+        if title_only == 1:
+            return f"{BASE_URL}/search/{sid}/?q={q}&c[older_than]={before}&o=date&c[title_only]=1"
+        return f"{BASE_URL}/search/{sid}/?q={q}&c[older_than]={before}&o=date"
+    finally:
+        del tree
+        gc.collect()
 
 def get_total_pages(html_str: str):
-    tree = HTMLParser(html_str)
-    nav = tree.css_first("ul.pageNav-main")
-    if not nav:
-        return 1
-    pages = [int(a.text(strip=True)) for a in nav.css("li.pageNav-page a") if a.text(strip=True).isdigit()]
-    return max(pages) if pages else 1
+    tree = LexborHTMLParser(html_str)
+    try:
+        nav = tree.css_first("ul.pageNav-main")
+        if not nav:
+            return 1
+        pages = [int(a.text(strip=True)) for a in nav.css("li.pageNav-page a") if a.text(strip=True).isdigit()]
+        return max(pages) if pages else 1
+    finally:
+        del tree
+        gc.collect()
 
 def extract_threads(html_str: str):
-    tree = HTMLParser(html_str)
-    threads = []
-    for a in tree.css("a[href]"):
-        href = a.attributes.get("href", "")
-        if "threads/" in href and not href.startswith("#") and "page-" not in href:
-            full_link = urljoin(BASE_URL, href)
-            if full_link not in threads:
-                threads.append(full_link)
-    return threads
+    tree = LexborHTMLParser(html_str)
+    try:
+        threads = []
+        for a in tree.css("a[href]"):
+            href = a.attributes.get("href", "")
+            if "threads/" in href and not href.startswith("#") and "page-" not in href:
+                full_link = urljoin(BASE_URL, href)
+                if full_link not in threads:
+                    threads.append(full_link)
+        return threads
+    finally:
+        del tree
+        gc.collect()
 
 # ───────────────────────────────
 # 🌐 FETCH
@@ -169,6 +181,8 @@ async def process_batch(client, batch_num, start_url, query, title_only):
         logger.info(f"Page {page_num}: {len(threads)} threads")
         await asyncio.sleep(DELAY_BETWEEN_REQUESTS)
 
+    gc.collect()  # Aggressive GC after batch processing
+
     if find_view_older_link(result["html"], title_only):
         logger.info("→ Older results found!")
     return batch_data, find_view_older_link(result["html"], title_only)
@@ -179,7 +193,8 @@ async def collect_threads(query, title_only, threads_dir):
     batch_num = 1
     current_url = start_url
     
-    async with httpx.AsyncClient() as client:
+    limits = httpx.Limits(max_connections=3, max_keepalive_connections=2)
+    async with httpx.AsyncClient(limits=limits) as client:
         while current_url:
             batch_data, next_url = await process_batch(client, batch_num, current_url, query, title_only)
             if not batch_data:
@@ -197,6 +212,8 @@ async def collect_threads(query, title_only, threads_dir):
                 break
             current_url = next_url
             batch_num += 1
+
+    gc.collect()  # Aggressive GC after collecting all threads
 
 # ───────────────────────────────
 # 📺 ARTICLE COLLECTOR
@@ -239,48 +256,55 @@ async def process_thread(client: httpx.AsyncClient, post_url, patterns, semaphor
         if not html_str:
             return []
         
-        tree = HTMLParser(html_str)
-        articles = tree.css("article.message--post")
-        matched = []
-        
-        for article in articles:
-            post_id = article.attributes.get("data-content", "").replace("post-", "") or "unknown"
-            if post_id == "unknown":
-                continue
+        tree = LexborHTMLParser(html_str)
+        try:
+            articles = tree.css("article.message--post")
+            matched = []
             
-            is_match = article_matches_patterns(article, patterns)
-            thread_match = re.search(r"/threads/([^/]+)\.(\d+)/?", post_url)
+            for article in articles:
+                post_id = article.attributes.get("data-content", "").replace("post-", "") or "unknown"
+                if post_id == "unknown":
+                    continue
+                
+                is_match = article_matches_patterns(article, patterns)
+                thread_match = re.search(r"/threads/([^/]+)\.(\d+)/?", post_url)
+                
+                if thread_match:
+                    slug = thread_match.group(1)
+                    tid = thread_match.group(2)
+                    post_url_full = f"{BASE_URL}/threads/{slug}.{tid}/post-{post_id}"
+                else:
+                    post_url_full = post_url
+                
+                date_tag = article.css_first("time.u-dt")
+                post_date = pendulum.now().strftime("%Y-%m-%d")
+                if date_tag and "datetime" in date_tag.attributes:
+                    try:
+                        post_date = pendulum.parse(date_tag.attributes["datetime"]).strftime("%Y-%m-%d")
+                    except:
+                        pass
+                
+                matched.append({
+                    "url": post_url_full,
+                    "post_id": post_id,
+                    "matched": is_match,
+                    "post_date": post_date,
+                    "article_html": article.html
+                })
             
-            if thread_match:
-                slug = thread_match.group(1)
-                tid = thread_match.group(2)
-                post_url_full = f"{BASE_URL}/threads/{slug}.{tid}/post-{post_id}"
-            else:
-                post_url_full = post_url
-            
-            date_tag = article.css_first("time.u-dt")
-            post_date = datetime.now().strftime("%Y-%m-%d")
-            if date_tag and "datetime" in date_tag.attributes:
-                try:
-                    post_date = datetime.strptime(date_tag.attributes["datetime"], "%Y-%m-%dT%H:%M:%S%z").strftime("%Y-%m-%d")
-                except:
-                    pass
-            
-            matched.append({
-                "url": post_url_full,
-                "post_id": post_id,
-                "matched": is_match,
-                "post_date": post_date,
-                "article_html": article.html
-            })
-        
-        return [a for a in matched if a["matched"]] or matched
+            return [a for a in matched if a["matched"]] or matched
+        finally:
+            del tree
+            gc.collect()
 
 async def process_threads_concurrent(thread_urls, patterns):
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
     async with httpx.AsyncClient() as client:
         tasks = [process_thread(client, url, patterns, semaphore) for url in thread_urls]
         results = await asyncio.gather(*tasks)
+    
+    gc.collect()  # Aggressive GC after concurrent processing
+    
     return [item for sublist in results for item in sublist]
 
 # ───────────────────────────────
@@ -291,50 +315,54 @@ def extract_media_from_html(raw_html: str):
         return []
     
     html_content = html.unescape(raw_html)
-    tree = HTMLParser(html_content)
-    urls = set()
-    
-    for node in tree.css("*[src]"):
-        src = node.attributes.get("src", "").strip()
-        if src:
-            if "/vh/dli?" in src:
-                src = src.replace("/vh/dli?", "/vh/dl?")
-            urls.add(src)
-    
-    for node in tree.css("*[data-src]"):
-        ds = node.attributes.get("data-src", "").strip()
-        if ds:
-            urls.add(ds)
-    
-    for node in tree.css("*[data-video]"):
-        dv = node.attributes.get("data-video", "").strip()
-        if dv:
-            urls.add(dv)
-    
-    for node in tree.css("video, video source"):
-        src = node.attributes.get("src", "").strip()
-        if src:
-            urls.add(src)
-    
-    for node in tree.css("*[style]"):
-        style = node.attributes.get("style") or ""
-        for m in re.findall(r'url\((.*?)\)', style):
-            m = m.strip('"\' ')
-            if m:
-                urls.add(m)
-    
-    for match in re.findall(r'https?://[^\s"\'<>]+', html_content):
-        urls.add(match.strip())
-    
-    media_urls = []
-    for u in urls:
-        if u:
-            low = u.lower()
-            if ("encoded$" in low and ".mp4" in low) or any(f".{ext}" in low for ext in VALID_EXTS):
-                full_url = urljoin(BASE_URL, u) if u.startswith("/") else u
-                media_urls.append(full_url)
-    
-    return list(dict.fromkeys(media_urls))
+    tree = LexborHTMLParser(html_content)
+    try:
+        urls = set()
+        
+        for node in tree.css("*[src]"):
+            src = node.attributes.get("src", "").strip()
+            if src:
+                if "/vh/dli?" in src:
+                    src = src.replace("/vh/dli?", "/vh/dl?")
+                urls.add(src)
+        
+        for node in tree.css("*[data-src]"):
+            ds = node.attributes.get("data-src", "").strip()
+            if ds:
+                urls.add(ds)
+        
+        for node in tree.css("*[data-video]"):
+            dv = node.attributes.get("data-video", "").strip()
+            if dv:
+                urls.add(dv)
+        
+        for node in tree.css("video, video source"):
+            src = node.attributes.get("src", "").strip()
+            if src:
+                urls.add(src)
+        
+        for node in tree.css("*[style]"):
+            style = node.attributes.get("style") or ""
+            for m in re.findall(r'url\((.*?)\)', style):
+                m = m.strip('"\' ')
+                if m:
+                    urls.add(m)
+        
+        for match in re.findall(r'https?://[^\s"\'<>]+', html_content):
+            urls.add(match.strip())
+        
+        media_urls = []
+        for u in urls:
+            if u:
+                low = u.lower()
+                if ("encoded$" in low and ".mp4" in low) or any(f".{ext}" in low for ext in VALID_EXTS):
+                    full_url = urljoin(BASE_URL, u) if u.startswith("/") else u
+                    media_urls.append(full_url)
+        
+        return list(dict.fromkeys(media_urls))
+    finally:
+        del tree
+        gc.collect()
 
 def filter_media(media_list, seen_global):
     filtered = []
@@ -359,7 +387,9 @@ async def process_articles_batch(batch_num, articles_file, media_dir):
         logger.error(f"❌ Error reading {articles_file}: {e}")
         return
     
-    articles.sort(key=lambda x: datetime.strptime(x.get("post_date", "1900-01-01"), "%Y-%m-%d"), reverse=True)
+    gc.collect()  # Aggressive GC after JSON file operation
+    
+    articles.sort(key=lambda x: pendulum.from_format(x.get("post_date", "1900-01-01"), "YYYY-MM-DD"), reverse=True)
     
     all_results = []
     all_media = set()
@@ -387,13 +417,15 @@ async def process_articles_batch(batch_num, articles_file, media_dir):
         if i % 10 == 0 or i == total_articles:
             logger.info(f"Processed {i}/{total_articles} posts")
     
-    all_results.sort(key=lambda x: datetime.strptime(x.get("post_date", "1900-01-01"), "%Y-%m-%d"), reverse=True)
+    all_results.sort(key=lambda x: pendulum.from_format(x.get("post_date", "1900-01-01"), "YYYY-MM-DD"), reverse=True)
     
     os.makedirs(media_dir, exist_ok=True)
     media_output = os.path.join(media_dir, f"batch_{batch_num:02d}_desifakes_media.json")
     
     with open(media_output, "w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2, ensure_ascii=False)
+    
+    gc.collect()  # Aggressive GC after JSON file operation
     
     logger.info(f"✓ Media extracted: {len(all_results)} posts → {media_output}")
     logger.info(f"⚠ No media: {len(no_media_posts)} posts")
@@ -925,24 +957,52 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
     batch_files = sorted([f for f in os.listdir(THREADS_DIR) if f.endswith(".json")])
     
     for idx, batch_file in enumerate(batch_files, 1):
-        with open(os.path.join(THREADS_DIR, batch_file), "r", encoding="utf-8") as f:
-            threads_data = json.load(f)
-
-        all_threads = []
-        for page_key in sorted(threads_data.keys(), key=lambda x: int(x.split("_")[1])):
-            all_threads.extend(threads_data[page_key])
-
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
-        async with httpx.AsyncClient() as client:
-            tasks = [process_thread(client, url, PATTERNS, semaphore) for url in all_threads]
-            results = await asyncio.gather(*tasks)
+        threads_data = None
+        all_threads = None
+        results = None
+        all_articles = None
         
-        all_articles = [item for sublist in results for item in sublist]
-        articles_output = os.path.join(ARTICLES_DIR, f"batch_{idx:02d}_desifakes_articles.json")
-        with open(articles_output, "w", encoding="utf-8") as f:
-            json.dump(all_articles, f, indent=2, ensure_ascii=False)
-        
-        await process_articles_batch(idx, articles_output, MEDIA_DIR)
+        try:
+            with open(os.path.join(THREADS_DIR, batch_file), "r", encoding="utf-8") as f:
+                threads_data = json.load(f)
+
+            gc.collect()  # Aggressive GC after JSON file operation
+
+            all_threads = []
+            for page_key in sorted(threads_data.keys(), key=lambda x: int(x.split("_")[1])):
+                all_threads.extend(threads_data[page_key])
+
+            semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
+            limits = httpx.Limits(max_connections=3, max_keepalive_connections=2)
+            async with httpx.AsyncClient(limits=limits) as client:
+                tasks = [process_thread(client, url, PATTERNS, semaphore) for url in all_threads]
+                results = await asyncio.gather(*tasks)
+            
+            gc.collect()  # Aggressive GC after concurrent processing
+            
+            all_articles = [item for sublist in results for item in sublist]
+            articles_output = os.path.join(ARTICLES_DIR, f"batch_{idx:02d}_desifakes_articles.json")
+            with open(articles_output, "w", encoding="utf-8") as f:
+                json.dump(all_articles, f, indent=2, ensure_ascii=False)
+            
+            await process_articles_batch(idx, articles_output, MEDIA_DIR)
+            
+            del threads_data
+            del all_threads
+            del results
+            del all_articles
+            gc.collect()
+        finally:
+            # Cleanup even on error
+            try: del threads_data
+            except NameError: pass
+            try: del all_threads
+            except NameError: pass
+            try: del results
+            except NameError: pass
+            try: del all_articles
+            except NameError: pass
+            gc.collect()
     
     # Update progress
     progress += 30 / total_users
@@ -962,6 +1022,8 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
             for entry in data:
                 entry["username"] = user
                 user_data.append(entry)
+    
+    gc.collect()  # Aggressive GC after JSON file operations
     
     # Deduplicate for individual
     seen_urls = set()
@@ -1022,6 +1084,8 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
     except:
         pass
     
+    gc.collect()  # Aggressive GC after user completion
+    
     return user_data
 
 # ───────────────────────────────
@@ -1063,6 +1127,13 @@ async def handle_message(client: Client, message: Message):
                     break
         user_data_dict[user] = user_data
         all_data.extend(user_data)
+        try:
+            del user_data
+        except NameError:
+            pass
+        gc.collect()
+    
+    gc.collect()  # Aggressive GC after processing all users
     
     # Final progress
     progress = 100
@@ -1099,6 +1170,8 @@ async def handle_message(client: Client, message: Message):
             media_by_date_per_username[user][typ][date].append(url)
     
     html_content = create_html(media_by_date_per_username, usernames, 2019, 2025)
+    
+    gc.collect()  # Aggressive GC after HTML generation
     
     total_items = sum(len(media_list) for user_media in media_by_date_per_username.values() for media_type in user_media.values() for media_list in media_type.values())
     
@@ -1142,5 +1215,5 @@ async def handle_message(client: Client, message: Message):
 # MAIN
 # ───────────────────────────────
 if __name__ == "__main__":
-    threading.Thread(target=run_flask, daemon=True).start()
+    threading.Thread(target=run_fastapi, daemon=True).start()
     bot.run()
