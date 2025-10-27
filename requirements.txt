@@ -1,11 +1,11 @@
 aiohttp
 regex
 aioshutil
-selectolax==0.4.0
+selectolax
 loguru
-pyrogram==2.0.106
-tgcrypto==1.2.5
-flask==2.3.3
+pyrogram
+tgcrypto
+flask
 aiofiles
-rich==13.3.4
+rich
 httpx
