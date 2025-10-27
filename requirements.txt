@@ -1,9 +1,8 @@
-httpx
+aiohttp
+regex
+aioshutil
 selectolax
 loguru
 pyrogram
 tgcrypto
-fastapi
-uvicorn
-aioshutil
-pendulum
+flask
