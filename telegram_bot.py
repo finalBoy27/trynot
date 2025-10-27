@@ -1,16 +1,19 @@
 import asyncio
-import aiohttp
-import regex as re
+import httpx
+import re
 import os
 import json
 import time
 import html
 import math
 import gc
-import aioshutil as shutil
+import logging
+import shutil
 from urllib.parse import urlencode, urljoin
 from selectolax.parser import HTMLParser
-from loguru import logger
+from rich.console import Console
+from rich.table import Table
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TaskProgressColumn
 from datetime import datetime
 from pathlib import Path
 from io import BytesIO
@@ -39,15 +42,14 @@ INITIAL_SEARCH_ID = "46509052"
 ORDER = "date"
 NEWER_THAN = "2019"
 OLDER_THAN = "2025"
-TIMEOUT = 10.0
-DELAY_BETWEEN_REQUESTS = 0.2
+TIMEOUT = 13.0
+DELAY_BETWEEN_REQUESTS = 0.3
 THREADS_DIR = "Scraping/Threads"
 ARTICLES_DIR = "Scraping/Articles"
 MEDIA_DIR = "Scraping/Media"
-MAX_CONCURRENT_WORKERS = 10
-MAX_RETRIES = 3
-RETRY_DELAY = 2.0
-TEMP_DIR = "Scraping/Temp"
+MAX_CONCURRENT_WORKERS = 12
+MAX_RETRIES = 4
+RETRY_DELAY = 1.5
 
 VALID_EXTS = ["jpg", "jpeg", "png", "gif", "webp", "mp4", "mov", "avi", "mkv", "webm"]
 EXCLUDE_PATTERNS = ["/data/avatars/", "/data/assets/", "/data/addonflare/"]
@@ -67,16 +69,16 @@ HOSTS = [
     {"name":"Catbox","url":"https://catbox.moe/user/api.php","field":"fileToUpload","data":{"reqtype":"fileupload"}}
 ]
 
-API_ID = int(os.getenv("API_ID", 24536446))
+API_ID = int(os.getenv("API_ID", 24536446))  # 👈 Replace 123456 with your actual API_ID
 API_HASH = os.getenv("API_HASH", "baee9dd189e1fd1daf0fb7239f7ae704")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "7380785361:AAEYAi-qJNF3bKu0AlihcBCRvkyF3g3Z5y0")
 
 bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # ───────────────────────────────
-# 🌟 LOGURU LOGGER SETUP
+# 🌟 RICH CONSOLE SETUP
 # ───────────────────────────────
-logger.add(lambda msg: print(msg, end=""), level="INFO")
+console = Console()
 
 # ───────────────────────────────
 # 🧩 UTILITIES
@@ -100,64 +102,45 @@ def build_search_url(search_id, query, newer_than, older_than, page=None, older_
     return f"{base_url}?{urlencode(params)}"
 
 def find_view_older_link(html_str: str, title_only: int = 0):
-    tree = None
-    try:
-        tree = HTMLParser(html_str)
-        link_node = tree.css_first("div.block-footer a")
-        if not link_node or not link_node.attributes.get("href"):
-            return None
-        href = link_node.attributes["href"]
-        match = re.search(r"/search/(\d+)/older.*?before=(\d+).*?[&?]q=([^&]+)", href)
-        if not match:
-            return None
-        sid, before, q = match.groups()
-        if title_only == 1:
-            return f"{BASE_URL}/search/{sid}/?q={q}&c[older_than]={before}&o=date&c[title_only]=1"
-        return f"{BASE_URL}/search/{sid}/?q={q}&c[older_than]={before}&o=date"
-    finally:
-        del tree
-        gc.collect()
+    tree = HTMLParser(html_str)
+    link_node = tree.css_first("div.block-footer a")
+    if not link_node or not link_node.attributes.get("href"):
+        return None
+    href = link_node.attributes["href"]
+    match = re.search(r"/search/(\d+)/older.*?before=(\d+).*?[&?]q=([^&]+)", href)
+    if not match:
+        return None
+    sid, before, q = match.groups()
+    if title_only == 1:
+        return f"{BASE_URL}/search/{sid}/?q={q}&c[older_than]={before}&o=date&c[title_only]=1"
+    return f"{BASE_URL}/search/{sid}/?q={q}&c[older_than]={before}&o=date"
 
 def get_total_pages(html_str: str):
-    tree = None
-    try:
-        tree = HTMLParser(html_str)
-        nav = tree.css_first("ul.pageNav-main")
-        if not nav:
-            return 1
-        pages = [int(a.text(strip=True)) for a in nav.css("li.pageNav-page a") if a.text(strip=True).isdigit()]
-        return max(pages) if pages else 1
-    finally:
-        del tree
-        gc.collect()
+    tree = HTMLParser(html_str)
+    nav = tree.css_first("ul.pageNav-main")
+    if not nav:
+        return 1
+    pages = [int(a.text(strip=True)) for a in nav.css("li.pageNav-page a") if a.text(strip=True).isdigit()]
+    return max(pages) if pages else 1
 
 def extract_threads(html_str: str):
-    tree = None
-    try:
-        tree = HTMLParser(html_str)
-        threads = []
-        for a in tree.css("a[href]"):
-            href = a.attributes.get("href", "")
-            if "threads/" in href and not href.startswith("#") and "page-" not in href:
-                full_link = urljoin(BASE_URL, href)
-                if full_link not in threads:
-                    threads.append(full_link)
-        return threads
-    finally:
-        del tree
-        gc.collect()
+    tree = HTMLParser(html_str)
+    threads = []
+    for a in tree.css("a[href]"):
+        href = a.attributes.get("href", "")
+        if "threads/" in href and not href.startswith("#") and "page-" not in href:
+            full_link = urljoin(BASE_URL, href)
+            if full_link not in threads:
+                threads.append(full_link)
+    return threads
 
 # ───────────────────────────────
 # 🌐 FETCH
 # ───────────────────────────────
 async def fetch_page(client, url: str):
     try:
-        async with client.get(url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as resp:
-            if resp.status == 200:
-                html = await resp.text()
-                return {"ok": True, "html": html, "final_url": str(resp.url)}
-            else:
-                return {"ok": False, "html": "", "final_url": str(resp.url)}
+        r = await client.get(url, follow_redirects=True, timeout=TIMEOUT)
+        return {"ok": r.status_code == 200, "html": r.text, "final_url": str(r.url)}
     except Exception:
         return {"ok": False, "html": "", "final_url": url}
 
@@ -165,17 +148,20 @@ async def fetch_page(client, url: str):
 # 📦 THREAD COLLECTOR
 # ───────────────────────────────
 async def process_batch(client, batch_num, start_url, query, title_only):
-    logger.info(f"📦 Batch #{batch_num}: Collecting Threads")
+    console.rule(f"[bold green]📦 Batch #{batch_num}: Collecting Threads[/bold green]")
     resp = await fetch_page(client, start_url)
     if not resp["ok"]:
-        logger.error(f"Failed batch start URL")
+        console.print(f"[red]❌ Failed batch start URL[/red]")
         return None, None
 
     search_id = extract_search_id(resp["final_url"]) or INITIAL_SEARCH_ID
     total_pages = get_total_pages(resp["html"])
-    logger.info(f"✓ Found {total_pages} pages | Search ID: {search_id}")
+    console.print(f"[bold cyan]✓[/bold cyan] Found {total_pages} pages | Search ID: {search_id}\n")
 
     batch_data = {}
+    table = Table(title=f"Batch #{batch_num}")
+    table.add_column("Page", justify="right", style="cyan")
+    table.add_column("Threads", justify="center", style="yellow")
 
     for page_num in range(1, total_pages + 1):
         match = re.search(r"c\[older_than]=(\d+)", start_url)
@@ -185,18 +171,14 @@ async def process_batch(client, batch_num, start_url, query, title_only):
         result = await fetch_page(client, page_url)
         threads = extract_threads(result["html"]) if result["ok"] else []
         batch_data[f"page_{page_num}"] = threads
-        logger.info(f"Page {page_num}: {len(threads)} threads")
-        del result
-        gc.collect()
+        table.add_row(str(page_num), str(len(threads)))
         await asyncio.sleep(DELAY_BETWEEN_REQUESTS)
 
-    result = await fetch_page(client, page_url)
+    console.print(table)
+
     next_batch_url = find_view_older_link(result["html"], title_only)
-    del result
-    gc.collect()
-    
     if next_batch_url:
-        logger.info("→ Older results found!")
+        console.print(f"\n[green]→ Older results found![/green]\n")
     return batch_data, next_batch_url
 
 async def collect_threads(query, title_only, threads_dir):
@@ -205,7 +187,7 @@ async def collect_threads(query, title_only, threads_dir):
     batch_num = 1
     current_url = start_url
     
-    async with aiohttp.ClientSession() as client:
+    async with httpx.AsyncClient() as client:
         while current_url:
             batch_data, next_url = await process_batch(client, batch_num, current_url, query, title_only)
             if not batch_data:
@@ -216,13 +198,10 @@ async def collect_threads(query, title_only, threads_dir):
                 json.dump(batch_data, f, indent=2, ensure_ascii=False)
             
             total = sum(len(v) for v in batch_data.values())
-            logger.info(f"✓ Batch #{batch_num}: {total} threads → {file_name}")
-            
-            del batch_data
-            gc.collect()
+            console.print(f"[green]✓ Batch #{batch_num}:[/green] {total} threads → {file_name}\n")
             
             if not next_url:
-                logger.info("✓ All threads collected")
+                console.print("[yellow]✓ All threads collected[/yellow]\n")
                 break
             current_url = next_url
             batch_num += 1
@@ -230,12 +209,12 @@ async def collect_threads(query, title_only, threads_dir):
 # ───────────────────────────────
 # 📺 ARTICLE COLLECTOR
 # ───────────────────────────────
-async def make_request(client: aiohttp.ClientSession, url: str, retries=MAX_RETRIES) -> str:
+async def make_request(client: httpx.AsyncClient, url: str, retries=MAX_RETRIES) -> str:
     for attempt in range(1, retries + 1):
         try:
-            async with client.get(url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as resp:
-                resp.raise_for_status()
-                return await resp.text()
+            resp = await client.get(url, follow_redirects=True, timeout=TIMEOUT)
+            resp.raise_for_status()
+            return resp.text
         except Exception:
             if attempt < retries:
                 await asyncio.sleep(RETRY_DELAY)
@@ -262,68 +241,52 @@ def article_matches_patterns(article, patterns):
             pass
     return False
 
-async def process_thread(client: aiohttp.ClientSession, post_url, patterns, semaphore):
+async def process_thread(client: httpx.AsyncClient, post_url, patterns, semaphore):
     async with semaphore:
         html_str = await make_request(client, post_url)
         if not html_str:
             return []
         
-        tree = None
-        try:
-            tree = HTMLParser(html_str)
-            articles = tree.css("article.message--post")
-            matched = []
+        tree = HTMLParser(html_str)
+        articles = tree.css("article.message--post")
+        matched = []
+        
+        for article in articles:
+            post_id = article.attributes.get("data-content", "").replace("post-", "") or "unknown"
+            if post_id == "unknown":
+                continue
             
-            for article in articles:
-                post_id = article.attributes.get("data-content", "").replace("post-", "") or "unknown"
-                if post_id == "unknown":
-                    continue
-                
-                is_match = article_matches_patterns(article, patterns)
-                thread_match = re.search(r"/threads/([^/]+)\.(\d+)/?", post_url)
-                
-                if thread_match:
-                    slug = thread_match.group(1)
-                    tid = thread_match.group(2)
-                    post_url_full = f"{BASE_URL}/threads/{slug}.{tid}/post-{post_id}"
-                else:
-                    post_url_full = post_url
-                
-                date_tag = article.css_first("time.u-dt")
-                post_date = datetime.now().strftime("%Y-%m-%d")
-                if date_tag and "datetime" in date_tag.attributes:
-                    try:
-                        post_date = datetime.strptime(date_tag.attributes["datetime"], "%Y-%m-%dT%H:%M:%S%z").strftime("%Y-%m-%d")
-                    except:
-                        pass
-                
-                matched.append({
-                    "url": post_url_full,
-                    "post_id": post_id,
-                    "matched": is_match,
-                    "post_date": post_date,
-                    "article_html": article.html
-                })
+            is_match = article_matches_patterns(article, patterns)
+            thread_match = re.search(r"/threads/([^/]+)\.(\d+)/?", post_url)
             
-            result = [a for a in matched if a["matched"]] or matched
-            # Do not delete `tree` here - the `finally` block should handle cleanup.
-            del html_str
-            gc.collect()
-            return result
-        finally:
-            # `tree` is declared above as None; check against None to avoid
-            # UnboundLocalError if it was deleted earlier.
-            try:
-                if tree is not None:
-                    del tree
-            except NameError:
-                # In the unlikely case `tree` isn't defined, ignore.
-                pass
-            gc.collect()
+            if thread_match:
+                slug = thread_match.group(1)
+                tid = thread_match.group(2)
+                post_url_full = f"{BASE_URL}/threads/{slug}.{tid}/post-{post_id}"
+            else:
+                post_url_full = post_url
+            
+            date_tag = article.css_first("time.u-dt")
+            post_date = datetime.now().strftime("%Y-%m-%d")
+            if date_tag and "datetime" in date_tag.attributes:
+                try:
+                    post_date = datetime.strptime(date_tag.attributes["datetime"], "%Y-%m-%dT%H:%M:%S%z").strftime("%Y-%m-%d")
+                except:
+                    pass
+            
+            matched.append({
+                "url": post_url_full,
+                "post_id": post_id,
+                "matched": is_match,
+                "post_date": post_date,
+                "article_html": article.html
+            })
+        
+        return [a for a in matched if a["matched"]] or matched
 
 async def process_threads_concurrent(thread_urls, patterns):
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
-    async with aiohttp.ClientSession() as client:
+    async with httpx.AsyncClient() as client:
         tasks = [process_thread(client, url, patterns, semaphore) for url in thread_urls]
         results = await asyncio.gather(*tasks)
     return [item for sublist in results for item in sublist]
@@ -335,66 +298,51 @@ def extract_media_from_html(raw_html: str):
     if not raw_html:
         return []
     
-    tree = None
-    try:
-        html_content = html.unescape(raw_html)
-        tree = HTMLParser(html_content)
-        urls = set()
-        
-        for node in tree.css("*[src]"):
-            src = node.attributes.get("src", "").strip()
-            if src:
-                if "/vh/dli?" in src:
-                    src = src.replace("/vh/dli?", "/vh/dl?")
-                urls.add(src)
-        
-        for node in tree.css("*[data-src]"):
-            ds = node.attributes.get("data-src", "").strip()
-            if ds:
-                urls.add(ds)
-        
-        for node in tree.css("*[data-video]"):
-            dv = node.attributes.get("data-video", "").strip()
-            if dv:
-                urls.add(dv)
-        
-        for node in tree.css("video, video source"):
-            src = node.attributes.get("src", "").strip()
-            if src:
-                urls.add(src)
-        
-        for node in tree.css("*[style]"):
-            style = node.attributes.get("style") or ""
-            for m in re.findall(r'url\((.*?)\)', style):
-                m = m.strip('"\' ')
-                if m:
-                    urls.add(m)
-        
-        for match in re.findall(r'https?://[^\s"\'<>]+', html_content):
-            urls.add(match.strip())
-        
-        media_urls = []
-        for u in urls:
-            if u:
-                low = u.lower()
-                if ("encoded$" in low and ".mp4" in low) or any(f".{ext}" in low for ext in VALID_EXTS):
-                    full_url = urljoin(BASE_URL, u) if u.startswith("/") else u
-                    media_urls.append(full_url)
-        
-        # Do not delete `tree` here - the `finally` block should handle cleanup.
-        del html_content
-        gc.collect()
-        return list(dict.fromkeys(media_urls))
-    finally:
-        # `tree` is declared above as None; check against None to avoid
-        # UnboundLocalError if it was deleted earlier.
-        try:
-            if tree is not None:
-                del tree
-        except NameError:
-            # In the unlikely case `tree` isn't defined, ignore.
-            pass
-        gc.collect()
+    html_content = html.unescape(raw_html)
+    tree = HTMLParser(html_content)
+    urls = set()
+    
+    for node in tree.css("*[src]"):
+        src = node.attributes.get("src", "").strip()
+        if src:
+            if "/vh/dli?" in src:
+                src = src.replace("/vh/dli?", "/vh/dl?")
+            urls.add(src)
+    
+    for node in tree.css("*[data-src]"):
+        ds = node.attributes.get("data-src", "").strip()
+        if ds:
+            urls.add(ds)
+    
+    for node in tree.css("*[data-video]"):
+        dv = node.attributes.get("data-video", "").strip()
+        if dv:
+            urls.add(dv)
+    
+    for node in tree.css("video, video source"):
+        src = node.attributes.get("src", "").strip()
+        if src:
+            urls.add(src)
+    
+    for node in tree.css("*[style]"):
+        style = node.attributes.get("style") or ""
+        for m in re.findall(r'url\((.*?)\)', style):
+            m = m.strip('"\' ')
+            if m:
+                urls.add(m)
+    
+    for match in re.findall(r'https?://[^\s"\'<>]+', html_content):
+        urls.add(match.strip())
+    
+    media_urls = []
+    for u in urls:
+        if u:
+            low = u.lower()
+            if ("encoded$" in low and ".mp4" in low) or any(f".{ext}" in low for ext in VALID_EXTS):
+                full_url = urljoin(BASE_URL, u) if u.startswith("/") else u
+                media_urls.append(full_url)
+    
+    return list(dict.fromkeys(media_urls))
 
 def filter_media(media_list, seen_global):
     filtered = []
@@ -409,13 +357,13 @@ def filter_media(media_list, seen_global):
     return filtered
 
 async def process_articles_batch(batch_num, articles_file, media_dir):
-    logger.info(f"🎬 Batch #{batch_num}: Extracting Media")
+    console.rule(f"[bold cyan]🎬 Batch #{batch_num}: Extracting Media[/bold cyan]")
     
     try:
         with open(articles_file, "r", encoding="utf-8") as f:
             articles = json.load(f)
     except Exception as e:
-        logger.error(f"Error reading {articles_file}: {e}")
+        console.print(f"[red]❌ Error reading {articles_file}: {e}[/red]")
         return
     
     articles.sort(key=lambda x: datetime.strptime(x.get("post_date", "1900-01-01"), "%Y-%m-%d"), reverse=True)
@@ -424,26 +372,36 @@ async def process_articles_batch(batch_num, articles_file, media_dir):
     all_media = set()
     no_media_posts = []
     
-    for entry in articles:
-        html_data = entry.get("article_html", "")
-        media_urls = extract_media_from_html(html_data)
-        media_urls = filter_media(media_urls, all_media)
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold cyan]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TextColumn("[bold green]{task.completed}/{task.total}"),
+        console=console,
+        transient=True
+    ) as progress:
+        task = progress.add_task("Processing posts...", total=len(articles))
         
-        post_id = entry.get("post_id") or "unknown"
-        
-        if not media_urls:
-            no_media_posts.append(entry.get("url", "(unknown)"))
-        
-        all_results.append({
-            "url": entry.get("url", ""),
-            "post_id": post_id,
-            "post_date": entry.get("post_date", ""),
-            "media_count": len(media_urls),
-            "media": media_urls
-        })
-        
-        del html_data
-        del media_urls
+        for entry in articles:
+            html_data = entry.get("article_html", "")
+            media_urls = extract_media_from_html(html_data)
+            media_urls = filter_media(media_urls, all_media)
+            
+            post_id = entry.get("post_id") or "unknown"
+            
+            if not media_urls:
+                no_media_posts.append(entry.get("url", "(unknown)"))
+            
+            all_results.append({
+                "url": entry.get("url", ""),
+                "post_id": post_id,
+                "post_date": entry.get("post_date", ""),
+                "media_count": len(media_urls),
+                "media": media_urls
+            })
+            
+            progress.update(task, advance=1)
     
     all_results.sort(key=lambda x: datetime.strptime(x.get("post_date", "1900-01-01"), "%Y-%m-%d"), reverse=True)
     
@@ -453,13 +411,8 @@ async def process_articles_batch(batch_num, articles_file, media_dir):
     with open(media_output, "w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2, ensure_ascii=False)
     
-    logger.info(f"✓ Media extracted: {len(all_results)} posts → {media_output}")
-    logger.info(f"⚠ No media: {len(no_media_posts)} posts")
-    
-    del articles
-    del all_results
-    del all_media
-    gc.collect()
+    console.print(f"[green]✓ Media extracted:[/green] {len(all_results)} posts → {media_output}")
+    console.print(f"[yellow]⚠ No media:[/yellow] {len(no_media_posts)} posts\n")
 
 # ───────────────────────────────
 # 📄 HTML GENERATOR
@@ -467,11 +420,13 @@ async def process_articles_batch(batch_num, articles_file, media_dir):
 def create_html(media_by_date_per_username, usernames, start_year, end_year):
     usernames_str = ", ".join(usernames)
     title = f"{usernames_str} - Media Gallery"
-    logger.info(f"Generating HTML for usernames: {usernames_str}")
+    console.print(f"Generating HTML for usernames: {usernames_str}")
 
+    # Prepare mediaData as a Python dictionary for JSON serialization
     media_data = {}
     total_items = 0
     media_counts = {}
+    # Add type counts for all media
     total_type_counts = {'images': 0, 'videos': 0, 'gifs': 0}
     
     for username in usernames:
@@ -484,9 +439,10 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
             for date in sorted(media_by_date[media_type].keys(), reverse=True):
                 for item in media_by_date[media_type][date]:
                     if not item.startswith(('http://', 'https://')):
-                        logger.info(f"Skipping invalid URL for {username}: {item}")
+                        console.print(f"Skipping invalid URL for {username}: {item}")
                         continue
                     try:
+                        # Ensure URL is properly escaped
                         safe_src = html.escape(item).replace('"', '\\"').replace('\n', '')
                         media_list.append({
                             'type': media_type,
@@ -497,7 +453,7 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
                         user_type_counts[media_type] += 1
                         total_type_counts[media_type] += 1
                     except Exception as e:
-                        logger.error(f"Failed to process media item for {username}: {item}, error: {str(e)}")
+                        console.print(f"Failed to process media item for {username}: {item}, error: {str(e)}")
                         continue
 
         media_list = sorted(media_list, key=lambda x: x['date'], reverse=True)
@@ -507,23 +463,26 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
         total_items += count
 
     if total_items == 0:
-        logger.info(f"No media items found for {usernames_str}")
+        console.print(f"No media items found for {usernames_str}")
         return None
 
+    # Check HTML size to prevent truncation
     estimated_size = sum(len(str(item)) for user_items in media_data.values() for item in user_items) / (1024 * 1024)
     if estimated_size > MAX_FILE_SIZE_MB:
-        logger.info(f"Estimated HTML size {estimated_size:.2f} MB exceeds limit of {MAX_FILE_SIZE_MB} MB")
+        console.print(f"Estimated HTML size {estimated_size:.2f} MB exceeds limit of {MAX_FILE_SIZE_MB} MB")
         return None
 
+    # Serialize mediaData to JSON to ensure valid structure
     try:
         media_data_json = json.dumps(media_data, ensure_ascii=False, indent=2)
     except Exception as e:
-        logger.error(f"Failed to serialize mediaData to JSON: {str(e)}")
+        console.print(f"Failed to serialize mediaData to JSON: {str(e)}")
         return None
 
+    # Calculate default itemsPerPage
     default_items_per_page = max(1, math.ceil(total_items / MAX_PAGINATION_RANGE))
 
-    html_content = f"""<!DOCTYPE html>
+    html_fragments = [f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -546,6 +505,21 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
     .column {{ flex: 1; display: flex; flex-direction: column; gap: 10px; }}
     .column img, .column video {{ width: 100%; border-radius: 5px; display: block; }}
     .column video {{ background-color: #111; }}
+    .column video[title*="Video file"] {{ 
+      position: relative; 
+      cursor: pointer;
+    }}
+    .column video[title*="Video file"]::after {{ 
+      content: "🎬"; 
+      position: absolute; 
+      top: 5px; 
+      right: 5px; 
+      background-color: rgba(0,0,0,0.7); 
+      color: white; 
+      padding: 2px 5px; 
+      border-radius: 3px; 
+      font-size: 12px;
+    }}
     @media (max-width: 768px) {{ 
       .masonry {{ flex-direction: column; }} 
       .filter-button {{ padding: 8px 15px; font-size: 14px; }} 
@@ -661,6 +635,7 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
         }}
         const start = (page - 1) * itemsPerPage;
         const end = start + itemsPerPage;
+        console.log('getOrderedMedia:', {{ mediaType, itemsPerUser, itemsPerPage, page, start, end, total: allMedia.length }});
         return {{ media: allMedia.slice(start, end), total: allMedia.length }};
       }} catch (e) {{
         console.error('Error in getOrderedMedia:', e);
@@ -672,7 +647,12 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
       try {{
         pagination.innerHTML = '';
         const totalPages = Math.ceil(totalItems / itemsPerPage);
-        if (totalPages <= 1) return;
+        if (totalPages <= 1) {{
+          console.log('updatePagination: Only one page, no pagination needed');
+          return;
+        }}
+
+        console.log('updatePagination:', {{ totalItems, itemsPerPage, currentPage: window.currentPage, totalPages }});
 
         const maxButtons = 5;
         let startPage = Math.max(1, window.currentPage - Math.floor(maxButtons / 2));
@@ -688,6 +668,7 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
         prevButton.addEventListener('click', () => {{
           if (window.currentPage > 1) {{
             window.currentPage--;
+            console.log('Previous button clicked, new currentPage:', window.currentPage);
             renderMedia();
           }}
         }});
@@ -700,6 +681,7 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
           pageButton.addEventListener('click', (function(pageNumber) {{
             return function() {{
               window.currentPage = pageNumber;
+              console.log('Page button clicked, new currentPage:', window.currentPage);
               renderMedia();
             }};
           }})(i));
@@ -713,6 +695,7 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
         nextButton.addEventListener('click', () => {{
           if (window.currentPage < totalPages) {{
             window.currentPage++;
+            console.log('Next button clicked, new currentPage:', window.currentPage);
             renderMedia();
           }}
         }});
@@ -731,6 +714,7 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
         const result = getOrderedMedia(mediaType, itemsPerUser, itemsPerPage, window.currentPage);
         const allMedia = result.media;
         const totalItems = result.total;
+        console.log('renderMedia:', {{ mediaType, itemsPerUser, itemsPerPage, currentPage: window.currentPage, mediaCount: allMedia.length, totalItems }});
         updatePagination(totalItems, itemsPerPage, window.currentPage);
 
         const columnsCount = 3;
@@ -796,6 +780,7 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
           button.classList.add('active');
           selectedUsername = username;
           window.currentPage = 1;
+          console.log('Filter button clicked, selectedUsername:', username, 'currentPage:', window.currentPage);
           updateButtonLabels();
           renderMedia();
         }} catch (e) {{
@@ -807,6 +792,7 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
     mediaTypeSelect.addEventListener('change', () => {{
       try {{
         window.currentPage = 1;
+        console.log('Media type changed, resetting currentPage to 1');
         renderMedia();
       }} catch (e) {{
         console.error('Error in mediaTypeSelect change handler:', e);
@@ -816,6 +802,7 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
     itemsPerUserInput.addEventListener('input', () => {{
       try {{
         window.currentPage = 1;
+        console.log('Items per user changed, resetting currentPage to 1');
         renderMedia();
       }} catch (e) {{
         console.error('Error in itemsPerUserInput input handler:', e);
@@ -825,6 +812,7 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
     itemsPerPageInput.addEventListener('input', () => {{
       try {{
         window.currentPage = 1;
+        console.log('Items per page changed, resetting currentPage to 1');
         renderMedia();
       }} catch (e) {{
         console.error('Error in itemsPerPageInput input handler:', e);
@@ -849,56 +837,67 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
     }}
   </script>
 </body>
-</html>"""
-
-    logger.info(f"Generated HTML with {total_items} items, size: {len(html_content) / (1024 * 1024):.2f} MB")
+</html>"""]
     
+
+    html_content = "".join(html_fragments)
+    console.print(f"Generated HTML with {total_items} items, size: {len(html_content) / (1024 * 1024):.2f} MB")
+    
+    # Clean up temporary data to free memory
     try:
+        html_fragments.clear()
+        del html_fragments
+        media_data.clear()
         del media_data
+        media_counts.clear()
         del media_counts
-        gc.collect()
-        logger.info("✅ Memory cleaned up after HTML generation")
+        gc.collect()  # Force garbage collection after HTML generation
+        console.print("✅ Memory cleaned up after HTML generation")
     except Exception as cleanup_error:
-        logger.error(f"Error during HTML generation cleanup: {str(cleanup_error)}")
-        gc.collect()
+        console.print(f"Error during HTML generation cleanup: {str(cleanup_error)}")
+        gc.collect()  # Still attempt garbage collection
     
     return html_content
 
 # ───────────────────────────────
-# 📤 UPLOAD FUNCTIONS
+# � UPLOAD FUNCTIONS
 # ───────────────────────────────
-async def upload_file(session: aiohttp.ClientSession, host, data):
+async def upload_file(client, host, data):
     buf = BytesIO(data)
-    data_form = aiohttp.FormData()
-    data_form.add_field(host["field"], buf, filename=UPLOAD_FILE, content_type="text/html")
-    for k, v in host.get("data", {}).items():
-        data_form.add_field(k, v)
+    files = {host["field"]:(UPLOAD_FILE, buf, "text/html")}
     try:
-        async with session.post(host["url"], data=data_form, timeout=aiohttp.ClientTimeout(total=30.0)) as resp:
-            if resp.status in (200, 201):
-                if host["name"] == "HTML Hosting":
-                    j = await resp.json()
-                    if j.get("success") and j.get("url"):
-                        return (host["name"], j["url"])
-                    else:
-                        return (host["name"], f"Error: {j.get('error', 'Unknown')}")
+        r = await client.post(host["url"], files=files, data=host.get("data", {}), timeout=30.0)
+        if r.status_code in (200,201):
+            if host["name"]=="HTML Hosting":
+                j = r.json()
+                if j.get("success") and j.get("url"):
+                    return (host["name"], j["url"])
                 else:
-                    t = await resp.text()
-                    t = t.strip()
-                    if t.startswith("https://"):
-                        if host["name"] == "Litterbox" and "files.catbox.moe" in t:
-                            t = "https://litterbox.catbox.moe/" + t.split("/")[-1]
-                        return (host["name"], t)
-                    return (host["name"], f"Invalid response: {t[:100]}")
-            return (host["name"], f"HTTP {resp.status}")
+                    return (host["name"], f"Error: {j.get('error','Unknown')}")
+            else:
+                t = r.text.strip()
+                if t.startswith("https://"):
+                    if host["name"]=="Litterbox" and "files.catbox.moe" in t:
+                        t = "https://litterbox.catbox.moe/"+t.split("/")[-1]
+                    return (host["name"], t)
+                return (host["name"], f"Invalid response: {t[:100]}")
+        return (host["name"], f"HTTP {r.status_code}")
     except Exception as e:
         return (host["name"], f"Exception: {e}")
+
+# ───────────────────────────────
+# PROGRESS BAR
+# ───────────────────────────────
+def generate_bar(percentage):
+    filled = int(percentage / 10)
+    empty = 10 - filled
+    return "●" * filled + "○" * (empty // 2) + "◌" * (empty - empty // 2)
 
 # ───────────────────────────────
 # PROCESS USER
 # ───────────────────────────────
 async def process_user(user, title_only, user_idx, total_users, progress_msg, last_edit):
-    logger.info(f"🔍 Processing user: {user}")
+    console.print(f"🔍 Processing user: {user}")
     
     search_display = "+".join(user.split())
     tokens = [t for t in re.split(r"[,\s]+", user) if t]
@@ -919,7 +918,8 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
     
     # Update progress: start
     progress = (user_idx / total_users) * 100
-    msg = f"completed {user_idx}/{total_users}\n{progress:.2f}%\nprocess current username: {user}"
+    bar = generate_bar(progress)
+    msg = f"completed {user_idx}/{total_users}\n{bar} {progress:.2f}%\nprocess current username: {user}"
     now = time.time()
     if now - last_edit[0] > 3:
         await progress_msg.edit(msg)
@@ -930,7 +930,8 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
     
     # Update progress
     progress += 20 / total_users
-    msg = f"completed {user_idx}/{total_users}\n{progress:.2f}%\nprocess current username: {user} - threads collected"
+    bar = generate_bar(progress)
+    msg = f"completed {user_idx}/{total_users}\n{bar} {progress:.2f}%\nprocess current username: {user} - threads collected"
     now = time.time()
     if now - last_edit[0] > 3:
         await progress_msg.edit(msg)
@@ -940,49 +941,36 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
     batch_files = sorted([f for f in os.listdir(THREADS_DIR) if f.endswith(".json")])
     
     for idx, batch_file in enumerate(batch_files, 1):
-        threads_data = None
-        try:
-            with open(os.path.join(THREADS_DIR, batch_file), "r", encoding="utf-8") as f:
-                threads_data = json.load(f)
+        with open(os.path.join(THREADS_DIR, batch_file), "r", encoding="utf-8") as f:
+            threads_data = json.load(f)
 
-            all_threads = []
-            for page_key in sorted(threads_data.keys(), key=lambda x: int(x.split("_")[1])):
-                all_threads.extend(threads_data[page_key])
+        all_threads = []
+        for page_key in sorted(threads_data.keys(), key=lambda x: int(x.split("_")[1])):
+            all_threads.extend(threads_data[page_key])
 
-            semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
-            async with aiohttp.ClientSession() as client:
-                tasks = [process_thread(client, url, PATTERNS, semaphore) for url in all_threads]
-                results = await asyncio.gather(*tasks)
-            
-            all_articles = [item for sublist in results for item in sublist]
-            articles_output = os.path.join(ARTICLES_DIR, f"batch_{idx:02d}_desifakes_articles.json")
-            with open(articles_output, "w", encoding="utf-8") as f:
-                json.dump(all_articles, f, indent=2, ensure_ascii=False)
-            
-            await process_articles_batch(idx, articles_output, MEDIA_DIR)
-            
-            del all_threads
-            del results
-            del all_articles
-            gc.collect()
-        finally:
-            if threads_data:
-                del threads_data
-            gc.collect()
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
+        async with httpx.AsyncClient() as client:
+            tasks = [process_thread(client, url, PATTERNS, semaphore) for url in all_threads]
+            results = await asyncio.gather(*tasks)
+        
+        all_articles = [item for sublist in results for item in sublist]
+        articles_output = os.path.join(ARTICLES_DIR, f"batch_{idx:02d}_desifakes_articles.json")
+        with open(articles_output, "w", encoding="utf-8") as f:
+            json.dump(all_articles, f, indent=2, ensure_ascii=False)
+        
+        await process_articles_batch(idx, articles_output, MEDIA_DIR)
     
     # Update progress
     progress += 30 / total_users
-    msg = f"completed {user_idx}/{total_users}\n{progress:.2f}%\nprocess current username: {user} - media extracted"
+    bar = generate_bar(progress)
+    msg = f"completed {user_idx}/{total_users}\n{bar} {progress:.2f}%\nprocess current username: {user} - media extracted"
     now = time.time()
     if now - last_edit[0] > 3:
         await progress_msg.edit(msg)
         last_edit[0] = now
     
-    # Collect user data to file
+    # Collect user data
     media_files = sorted([f for f in os.listdir(MEDIA_DIR) if f.startswith("batch_") and f.endswith("_desifakes_media.json")])
-    user_data_file = os.path.join(TEMP_DIR, f"user_{user_safe}_data.json")
-    os.makedirs(TEMP_DIR, exist_ok=True)
-    
     user_data = []
     for mf in media_files:
         with open(os.path.join(MEDIA_DIR, mf), "r", encoding="utf-8") as f:
@@ -1000,10 +988,6 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
                 seen_urls.add(url)
                 new_media.append(url)
         entry["media"] = new_media
-    
-    # Save to temp file
-    with open(user_data_file, "w", encoding="utf-8") as f:
-        json.dump(user_data, f, indent=2, ensure_ascii=False)
     
     # Generate individual HTML
     os.makedirs(HTML_DIR, exist_ok=True)
@@ -1037,14 +1021,10 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
         with open(individual_output, "w", encoding="utf-8") as f:
             f.write(html_content)
     
-    del user_data
-    del media_by_date
-    del html_content
-    gc.collect()
-    
     # Update progress
     progress += 20 / total_users
-    msg = f"completed {user_idx}/{total_users}\n{progress:.2f}%\nprocess current username: {user} - HTML generated"
+    bar = generate_bar(progress)
+    msg = f"completed {user_idx}/{total_users}\n{bar} {progress:.2f}%\nprocess current username: {user} - HTML generated"
     now = time.time()
     if now - last_edit[0] > 3:
         await progress_msg.edit(msg)
@@ -1052,13 +1032,13 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
     
     # Clean up for this user
     try:
-        await shutil.rmtree(THREADS_DIR)
-        await shutil.rmtree(ARTICLES_DIR)
-        await shutil.rmtree(MEDIA_DIR)
+        shutil.rmtree(THREADS_DIR)
+        shutil.rmtree(ARTICLES_DIR)
+        shutil.rmtree(MEDIA_DIR)
     except:
         pass
     
-    return user_data_file
+    return user_data
 
 # ───────────────────────────────
 # BOT HANDLER
@@ -1081,85 +1061,58 @@ async def handle_message(client: Client, message: Message):
     total_users = len(usernames)
     all_data = []
     last_edit = [0]
-    user_data_files = []
     
     # Send initial progress message
     progress_msg = await message.reply("Starting processing...")
     
+    user_data_dict = {}
     for user_idx, user in enumerate(usernames):
-        retry_count = 0
-        while retry_count < 3:
-            user_data_file = await process_user(user, title_only, user_idx, total_users, progress_msg, last_edit)
-            
-            # Check total media for this user
-            try:
-                with open(user_data_file, "r", encoding="utf-8") as f:
-                    user_data = json.load(f)
+        user_data = await process_user(user, title_only, user_idx, total_users, progress_msg, last_edit)
+        total_media = sum(len(entry.get("media", [])) for entry in user_data)
+        if total_media == 0:
+            for retry in range(3):
+                console.print(f"Retrying {user}, attempt {retry+1}")
+                await progress_msg.edit(f"Retrying {user} (attempt {retry+1})")
+                user_data = await process_user(user, title_only, user_idx, total_users, progress_msg, last_edit)
                 total_media = sum(len(entry.get("media", [])) for entry in user_data)
                 if total_media > 0:
                     break
-                else:
-                    retry_count += 1
-                    if retry_count < 3:
-                        logger.info(f"No media found for {user}, retrying ({retry_count}/3)")
-                        # Update progress to indicate retry
-                        progress = (user_idx / total_users) * 100
-                        msg = f"completed {user_idx}/{total_users}\n{progress:.2f}%\nRetrying {user} ({retry_count}/3)"
-                        now = time.time()
-                        if now - last_edit[0] > 3:
-                            await progress_msg.edit(msg)
-                            last_edit[0] = now
-                    else:
-                        logger.info(f"No media found for {user} after 3 retries")
-            except Exception as e:
-                logger.error(f"Error checking media for {user}: {e}")
-                break
-        
-        user_data_files.append(user_data_file)
+        user_data_dict[user] = user_data
+        all_data.extend(user_data)
     
     # Final progress
     progress = 100
-    msg = f"completed {total_users}/{total_users}\n{progress:.2f}%\nGenerating final gallery..."
+    bar = generate_bar(progress)
+    msg = f"completed {total_users}/{total_users}\n{bar} {progress:.2f}%\nGenerating final gallery..."
     await progress_msg.edit(msg)
     
-    # Load all user data from files
+    # Generate final
     media_by_date_per_username = {u: {"images": {}, "videos": {}, "gifs": {}} for u in usernames}
     
     seen_urls = set()
-    for user_idx, user_data_file in enumerate(user_data_files):
-        try:
-            with open(user_data_file, "r", encoding="utf-8") as f:
-                user_data = json.load(f)
-            
-            user = usernames[user_idx]
-            for entry in user_data:
-                date = entry.get("post_date", "")
-                if not date:
-                    continue
-                for url in entry.get("media", []):
-                    if url in seen_urls:
-                        continue
-                    seen_urls.add(url)
-                    if 'vh/dl?url' in url:
-                        typ = 'videos'
-                    elif 'vh/dli?' in url:
-                        typ = 'images'
-                    else:
-                        if '.mp4' in url.lower():
-                            typ = 'videos'
-                        elif '.gif' in url.lower():
-                            typ = 'gifs'
-                        else:
-                            typ = 'images'
-                    if date not in media_by_date_per_username[user][typ]:
-                        media_by_date_per_username[user][typ][date] = []
-                    media_by_date_per_username[user][typ][date].append(url)
-            
-            del user_data
-            gc.collect()
-            os.remove(user_data_file)
-        except Exception as e:
-            logger.error(f"Error processing user data file {user_data_file}: {e}")
+    for entry in all_data:
+        user = entry["username"]
+        date = entry.get("post_date", "")
+        if not date:
+            continue
+        for url in entry.get("media", []):
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            if 'vh/dl?url' in url:
+                typ = 'videos'
+            elif 'vh/dli?' in url:
+                typ = 'images'
+            else:
+                if '.mp4' in url.lower():
+                    typ = 'videos'
+                elif '.gif' in url.lower():
+                    typ = 'gifs'
+                else:
+                    typ = 'images'
+            if date not in media_by_date_per_username[user][typ]:
+                media_by_date_per_username[user][typ][date] = []
+            media_by_date_per_username[user][typ][date].append(url)
     
     html_content = create_html(media_by_date_per_username, usernames, 2019, 2025)
     
@@ -1172,7 +1125,7 @@ async def handle_message(client: Client, message: Message):
         # Upload
         with open(OUTPUT_FILE, "rb") as f:
             data = f.read()
-        async with aiohttp.ClientSession() as client:
+        async with httpx.AsyncClient() as client:
             tasks = [upload_file(client, h, data) for h in HOSTS]
             results = await asyncio.gather(*tasks)
         
@@ -1184,6 +1137,8 @@ async def handle_message(client: Client, message: Message):
         caption = f"Total Media in Html: {total_items}\n───────────────────────────────────\n📤 Uploading Final HTML to Hosting Services\n" + "\n".join(links)
         
         await message.reply_document(OUTPUT_FILE, caption=caption)
+        
+        # Delete progress message after sending the final gallery
         await progress_msg.delete()
         
         # Clean up
@@ -1191,15 +1146,11 @@ async def handle_message(client: Client, message: Message):
             for item in os.listdir("Scraping"):
                 path = os.path.join("Scraping", item)
                 if os.path.isdir(path):
-                    await shutil.rmtree(path)
+                    shutil.rmtree(path)
                 elif os.path.isfile(path) and path.endswith(".json"):
                     os.remove(path)
         except:
             pass
-        
-        del html_content
-        del media_by_date_per_username
-        gc.collect()
     else:
         await message.reply("Failed to generate HTML")
 
@@ -1207,4 +1158,5 @@ async def handle_message(client: Client, message: Message):
 # MAIN
 # ───────────────────────────────
 if __name__ == "__main__":
+    threading.Thread(target=run_flask, daemon=True).start()
     bot.run()
