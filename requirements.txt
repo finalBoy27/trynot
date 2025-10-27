@@ -6,3 +6,5 @@ loguru
 pyrogram
 tgcrypto
 flask
+httpx
+rich
