@@ -1,6 +1,10 @@
+aiohttp
+regex
+aioshutil
+selectolax==0.4.0
+loguru
 pyrogram==2.0.106
 tgcrypto==1.2.5
-httpx==0.26.0
-rich==13.3.4
-selectolax==0.4.0
 flask==2.3.3
+aiofiles
+rich==13.3.4
