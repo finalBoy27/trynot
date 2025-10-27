@@ -22,8 +22,6 @@ import threading
 from aiofiles.os import remove as aioremove
 from aiofiles import open as aiopen
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
 # Health check app
 app = Flask(__name__)
 
@@ -74,7 +72,7 @@ HOSTS = [
 
 API_ID = int(os.getenv("API_ID", 24536446))
 API_HASH = os.getenv("API_HASH", "baee9dd189e1fd1daf0fb7239f7ae704")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "7380785361:AAEYAi-qJNF3bKu0AlihcBCRvkyF3g3Z5y0")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "7380785361:AAEYAi-qJNF3bKu0AlihcBCRvkyF3g3Z5y0s")
 
 bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -177,7 +175,7 @@ async def process_batch(client, batch_num, start_url, query, title_only):
         return None, None
 
     search_id = extract_search_id(resp["final_url"]) or INITIAL_SEARCH_ID
-    total_pages = await asyncio.get_event_loop().run_in_executor(None, get_total_pages, resp["html"])
+    total_pages = get_total_pages(resp["html"])
     logger.info(f"✓ Found {total_pages} pages | Search ID: {search_id}")
 
     batch_data = {}
@@ -188,7 +186,7 @@ async def process_batch(client, batch_num, start_url, query, title_only):
         page_url = build_search_url(search_id, query, NEWER_THAN, OLDER_THAN, page_num, 
                                    None if batch_num == 1 else older_than_ts, title_only)
         result = await fetch_page(client, page_url)
-        threads = await asyncio.get_event_loop().run_in_executor(None, extract_threads, result["html"]) if result["ok"] else []
+        threads = extract_threads(result["html"]) if result["ok"] else []
         batch_data[f"page_{page_num}"] = threads
         logger.info(f"Page {page_num}: {len(threads)} threads")
         del result
@@ -196,7 +194,7 @@ async def process_batch(client, batch_num, start_url, query, title_only):
         await asyncio.sleep(DELAY_BETWEEN_REQUESTS)
 
     result = await fetch_page(client, page_url)
-    next_batch_url = await asyncio.get_event_loop().run_in_executor(None, find_view_older_link, result["html"], title_only)
+    next_batch_url = find_view_older_link(result["html"], title_only)
     del result
     gc.collect()
     
@@ -284,7 +282,7 @@ async def process_thread(client: aiohttp.ClientSession, post_url, patterns, sema
                 if post_id == "unknown":
                     continue
                 
-                is_match = await asyncio.get_event_loop().run_in_executor(None, article_matches_patterns, article, patterns)
+                is_match = article_matches_patterns(article, patterns)
                 thread_match = re.search(r"/threads/([^/]+)\.(\d+)/?", post_url)
                 
                 if thread_match:
@@ -432,7 +430,7 @@ async def process_articles_batch(batch_num, articles_file, media_dir):
     
     for entry in articles:
         html_data = entry.get("article_html", "")
-        media_urls = await asyncio.get_event_loop().run_in_executor(None, extract_media_from_html, html_data)
+        media_urls = extract_media_from_html(html_data)
         media_urls = filter_media(media_urls, all_media)
         
         post_id = entry.get("post_id") or "unknown"
@@ -1172,7 +1170,7 @@ async def handle_message(client: Client, message: Message):
         except Exception as e:
             logger.error(f"Error processing user data file {user_data_file}: {e}")
     
-    html_content = await asyncio.get_event_loop().run_in_executor(None, create_html, media_by_date_per_username, usernames, 2019, 2025)
+    html_content = create_html(media_by_date_per_username, usernames, 2019, 2025)
     
     total_items = sum(len(media_list) for user_media in media_by_date_per_username.values() for media_type in user_media.values() for media_list in media_type.values())
     
