@@ -1,11 +1,9 @@
-aiohttp
-regex
-aioshutil
+httpx
 selectolax
 loguru
 pyrogram
 tgcrypto
-flask
-aiofiles
-rich
-httpx
+fastapi
+uvicorn
+aioshutil
+pendulum
