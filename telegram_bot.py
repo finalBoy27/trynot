@@ -7,7 +7,6 @@ import time
 import html
 import math
 import gc
-import shutil
 from urllib.parse import urlencode, urljoin
 from selectolax.parser import HTMLParser
 from loguru import logger
@@ -18,6 +17,7 @@ from pyrogram import Client, filters
 from pyrogram.types import Update, Message
 from flask import Flask
 import threading
+from aioshutil import rmtree
 
 # Health check app
 app = Flask(__name__)
@@ -1016,9 +1016,9 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
     
     # Clean up for this user
     try:
-        shutil.rmtree(THREADS_DIR)
-        shutil.rmtree(ARTICLES_DIR)
-        shutil.rmtree(MEDIA_DIR)
+        await rmtree(THREADS_DIR)
+        await rmtree(ARTICLES_DIR)
+        await rmtree(MEDIA_DIR)
     except:
         pass
     
@@ -1130,7 +1130,7 @@ async def handle_message(client: Client, message: Message):
             for item in os.listdir("Scraping"):
                 path = os.path.join("Scraping", item)
                 if os.path.isdir(path):
-                    shutil.rmtree(path)
+                    await rmtree(path)
                 elif os.path.isfile(path) and path.endswith(".json"):
                     os.remove(path)
         except:
