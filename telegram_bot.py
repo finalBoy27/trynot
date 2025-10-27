@@ -7,13 +7,10 @@ import time
 import html
 import math
 import gc
-import logging
 import shutil
 from urllib.parse import urlencode, urljoin
 from selectolax.parser import HTMLParser
-from rich.console import Console
-from rich.table import Table
-from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TaskProgressColumn
+from loguru import logger
 from datetime import datetime
 from pathlib import Path
 from io import BytesIO
@@ -76,9 +73,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "7380785361:AAEYAi-qJNF3bKu0AlihcBCRvkyF3g3Z5
 bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # ───────────────────────────────
-# 🌟 RICH CONSOLE SETUP
+# 🌟 LOGURU SETUP
 # ───────────────────────────────
-console = Console()
+logger.add(lambda msg: print(msg, end=""), level="INFO")
 
 # ───────────────────────────────
 # 🧩 UTILITIES
@@ -148,21 +145,19 @@ async def fetch_page(client, url: str):
 # 📦 THREAD COLLECTOR
 # ───────────────────────────────
 async def process_batch(client, batch_num, start_url, query, title_only):
-    console.rule(f"[bold green]📦 Batch #{batch_num}: Collecting Threads[/bold green]")
+    logger.info("=" * 50)
+    logger.info(f"📦 Batch #{batch_num}: Collecting Threads")
     resp = await fetch_page(client, start_url)
     if not resp["ok"]:
-        console.print(f"[red]❌ Failed batch start URL[/red]")
+        logger.error(f"❌ Failed batch start URL")
         return None, None
 
     search_id = extract_search_id(resp["final_url"]) or INITIAL_SEARCH_ID
     total_pages = get_total_pages(resp["html"])
-    console.print(f"[bold cyan]✓[/bold cyan] Found {total_pages} pages | Search ID: {search_id}\n")
+    logger.info(f"✓ Found {total_pages} pages | Search ID: {search_id}")
 
     batch_data = {}
-    table = Table(title=f"Batch #{batch_num}")
-    table.add_column("Page", justify="right", style="cyan")
-    table.add_column("Threads", justify="center", style="yellow")
-
+    
     for page_num in range(1, total_pages + 1):
         match = re.search(r"c\[older_than]=(\d+)", start_url)
         older_than_ts = match.group(1) if match else None
@@ -171,15 +166,12 @@ async def process_batch(client, batch_num, start_url, query, title_only):
         result = await fetch_page(client, page_url)
         threads = extract_threads(result["html"]) if result["ok"] else []
         batch_data[f"page_{page_num}"] = threads
-        table.add_row(str(page_num), str(len(threads)))
+        logger.info(f"Page {page_num}: {len(threads)} threads")
         await asyncio.sleep(DELAY_BETWEEN_REQUESTS)
 
-    console.print(table)
-
-    next_batch_url = find_view_older_link(result["html"], title_only)
-    if next_batch_url:
-        console.print(f"\n[green]→ Older results found![/green]\n")
-    return batch_data, next_batch_url
+    if find_view_older_link(result["html"], title_only):
+        logger.info("→ Older results found!")
+    return batch_data, find_view_older_link(result["html"], title_only)
 
 async def collect_threads(query, title_only, threads_dir):
     os.makedirs(threads_dir, exist_ok=True)
@@ -198,10 +190,10 @@ async def collect_threads(query, title_only, threads_dir):
                 json.dump(batch_data, f, indent=2, ensure_ascii=False)
             
             total = sum(len(v) for v in batch_data.values())
-            console.print(f"[green]✓ Batch #{batch_num}:[/green] {total} threads → {file_name}\n")
+            logger.info(f"✓ Batch #{batch_num}: {total} threads → {file_name}")
             
             if not next_url:
-                console.print("[yellow]✓ All threads collected[/yellow]\n")
+                logger.info("✓ All threads collected")
                 break
             current_url = next_url
             batch_num += 1
@@ -357,13 +349,14 @@ def filter_media(media_list, seen_global):
     return filtered
 
 async def process_articles_batch(batch_num, articles_file, media_dir):
-    console.rule(f"[bold cyan]🎬 Batch #{batch_num}: Extracting Media[/bold cyan]")
+    logger.info("=" * 50)
+    logger.info(f"🎬 Batch #{batch_num}: Extracting Media")
     
     try:
         with open(articles_file, "r", encoding="utf-8") as f:
             articles = json.load(f)
     except Exception as e:
-        console.print(f"[red]❌ Error reading {articles_file}: {e}[/red]")
+        logger.error(f"❌ Error reading {articles_file}: {e}")
         return
     
     articles.sort(key=lambda x: datetime.strptime(x.get("post_date", "1900-01-01"), "%Y-%m-%d"), reverse=True)
@@ -372,36 +365,27 @@ async def process_articles_batch(batch_num, articles_file, media_dir):
     all_media = set()
     no_media_posts = []
     
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[bold cyan]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        TextColumn("[bold green]{task.completed}/{task.total}"),
-        console=console,
-        transient=True
-    ) as progress:
-        task = progress.add_task("Processing posts...", total=len(articles))
+    total_articles = len(articles)
+    for i, entry in enumerate(articles, 1):
+        html_data = entry.get("article_html", "")
+        media_urls = extract_media_from_html(html_data)
+        media_urls = filter_media(media_urls, all_media)
         
-        for entry in articles:
-            html_data = entry.get("article_html", "")
-            media_urls = extract_media_from_html(html_data)
-            media_urls = filter_media(media_urls, all_media)
-            
-            post_id = entry.get("post_id") or "unknown"
-            
-            if not media_urls:
-                no_media_posts.append(entry.get("url", "(unknown)"))
-            
-            all_results.append({
-                "url": entry.get("url", ""),
-                "post_id": post_id,
-                "post_date": entry.get("post_date", ""),
-                "media_count": len(media_urls),
-                "media": media_urls
-            })
-            
-            progress.update(task, advance=1)
+        post_id = entry.get("post_id") or "unknown"
+        
+        if not media_urls:
+            no_media_posts.append(entry.get("url", "(unknown)"))
+        
+        all_results.append({
+            "url": entry.get("url", ""),
+            "post_id": post_id,
+            "post_date": entry.get("post_date", ""),
+            "media_count": len(media_urls),
+            "media": media_urls
+        })
+        
+        if i % 10 == 0 or i == total_articles:
+            logger.info(f"Processed {i}/{total_articles} posts")
     
     all_results.sort(key=lambda x: datetime.strptime(x.get("post_date", "1900-01-01"), "%Y-%m-%d"), reverse=True)
     
@@ -411,8 +395,8 @@ async def process_articles_batch(batch_num, articles_file, media_dir):
     with open(media_output, "w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2, ensure_ascii=False)
     
-    console.print(f"[green]✓ Media extracted:[/green] {len(all_results)} posts → {media_output}")
-    console.print(f"[yellow]⚠ No media:[/yellow] {len(no_media_posts)} posts\n")
+    logger.info(f"✓ Media extracted: {len(all_results)} posts → {media_output}")
+    logger.info(f"⚠ No media: {len(no_media_posts)} posts")
 
 # ───────────────────────────────
 # 📄 HTML GENERATOR
@@ -420,7 +404,7 @@ async def process_articles_batch(batch_num, articles_file, media_dir):
 def create_html(media_by_date_per_username, usernames, start_year, end_year):
     usernames_str = ", ".join(usernames)
     title = f"{usernames_str} - Media Gallery"
-    console.print(f"Generating HTML for usernames: {usernames_str}")
+    logger.info(f"Generating HTML for usernames: {usernames_str}")
 
     # Prepare mediaData as a Python dictionary for JSON serialization
     media_data = {}
@@ -439,7 +423,7 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
             for date in sorted(media_by_date[media_type].keys(), reverse=True):
                 for item in media_by_date[media_type][date]:
                     if not item.startswith(('http://', 'https://')):
-                        console.print(f"Skipping invalid URL for {username}: {item}")
+                        logger.warning(f"Skipping invalid URL for {username}: {item}")
                         continue
                     try:
                         # Ensure URL is properly escaped
@@ -453,7 +437,7 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
                         user_type_counts[media_type] += 1
                         total_type_counts[media_type] += 1
                     except Exception as e:
-                        console.print(f"Failed to process media item for {username}: {item}, error: {str(e)}")
+                        logger.error(f"Failed to process media item for {username}: {item}, error: {str(e)}")
                         continue
 
         media_list = sorted(media_list, key=lambda x: x['date'], reverse=True)
@@ -463,20 +447,20 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
         total_items += count
 
     if total_items == 0:
-        console.print(f"No media items found for {usernames_str}")
+        logger.warning(f"No media items found for {usernames_str}")
         return None
 
     # Check HTML size to prevent truncation
     estimated_size = sum(len(str(item)) for user_items in media_data.values() for item in user_items) / (1024 * 1024)
     if estimated_size > MAX_FILE_SIZE_MB:
-        console.print(f"Estimated HTML size {estimated_size:.2f} MB exceeds limit of {MAX_FILE_SIZE_MB} MB")
+        logger.warning(f"Estimated HTML size {estimated_size:.2f} MB exceeds limit of {MAX_FILE_SIZE_MB} MB")
         return None
 
     # Serialize mediaData to JSON to ensure valid structure
     try:
         media_data_json = json.dumps(media_data, ensure_ascii=False, indent=2)
     except Exception as e:
-        console.print(f"Failed to serialize mediaData to JSON: {str(e)}")
+        logger.error(f"Failed to serialize mediaData to JSON: {str(e)}")
         return None
 
     # Calculate default itemsPerPage
@@ -841,7 +825,7 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
     
 
     html_content = "".join(html_fragments)
-    console.print(f"Generated HTML with {total_items} items, size: {len(html_content) / (1024 * 1024):.2f} MB")
+    logger.info(f"Generated HTML with {total_items} items, size: {len(html_content) / (1024 * 1024):.2f} MB")
     
     # Clean up temporary data to free memory
     try:
@@ -852,9 +836,9 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
         media_counts.clear()
         del media_counts
         gc.collect()  # Force garbage collection after HTML generation
-        console.print("✅ Memory cleaned up after HTML generation")
+        logger.info("✅ Memory cleaned up after HTML generation")
     except Exception as cleanup_error:
-        console.print(f"Error during HTML generation cleanup: {str(cleanup_error)}")
+        logger.error(f"Error during HTML generation cleanup: {str(cleanup_error)}")
         gc.collect()  # Still attempt garbage collection
     
     return html_content
@@ -897,7 +881,7 @@ def generate_bar(percentage):
 # PROCESS USER
 # ───────────────────────────────
 async def process_user(user, title_only, user_idx, total_users, progress_msg, last_edit):
-    console.print(f"🔍 Processing user: {user}")
+    logger.info(f"🔍 Processing user: {user}")
     
     search_display = "+".join(user.split())
     tokens = [t for t in re.split(r"[,\s]+", user) if t]
@@ -1071,7 +1055,7 @@ async def handle_message(client: Client, message: Message):
         total_media = sum(len(entry.get("media", [])) for entry in user_data)
         if total_media == 0:
             for retry in range(3):
-                console.print(f"Retrying {user}, attempt {retry+1}")
+                logger.info(f"Retrying {user}, attempt {retry+1}")
                 await progress_msg.edit(f"Retrying {user} (attempt {retry+1})")
                 user_data = await process_user(user, title_only, user_idx, total_users, progress_msg, last_edit)
                 total_media = sum(len(entry.get("media", [])) for entry in user_data)
