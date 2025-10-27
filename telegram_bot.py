@@ -19,9 +19,6 @@ from pyrogram.types import Update, Message
 from flask import Flask
 import threading
 
-from aiofiles.os import remove as aioremove
-from aiofiles import open as aiopen
-
 # Health check app
 app = Flask(__name__)
 
@@ -415,9 +412,8 @@ async def process_articles_batch(batch_num, articles_file, media_dir):
     logger.info(f"🎬 Batch #{batch_num}: Extracting Media")
     
     try:
-        async with aiopen(articles_file, "r", encoding="utf-8") as f:
-            content = await f.read()
-            articles = json.loads(content)
+        with open(articles_file, "r", encoding="utf-8") as f:
+            articles = json.load(f)
     except Exception as e:
         logger.error(f"Error reading {articles_file}: {e}")
         return
@@ -454,9 +450,8 @@ async def process_articles_batch(batch_num, articles_file, media_dir):
     os.makedirs(media_dir, exist_ok=True)
     media_output = os.path.join(media_dir, f"batch_{batch_num:02d}_desifakes_media.json")
     
-    async with aiopen(media_output, "w", encoding="utf-8") as f:
-        content = json.dumps(all_results, indent=2, ensure_ascii=False)
-        await f.write(content)
+    with open(media_output, "w", encoding="utf-8") as f:
+        json.dump(all_results, f, indent=2, ensure_ascii=False)
     
     logger.info(f"✓ Media extracted: {len(all_results)} posts → {media_output}")
     logger.info(f"⚠ No media: {len(no_media_posts)} posts")
@@ -947,9 +942,8 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
     for idx, batch_file in enumerate(batch_files, 1):
         threads_data = None
         try:
-            async with aiopen(os.path.join(THREADS_DIR, batch_file), "r", encoding="utf-8") as f:
-                content = await f.read()
-                threads_data = json.loads(content)
+            with open(os.path.join(THREADS_DIR, batch_file), "r", encoding="utf-8") as f:
+                threads_data = json.load(f)
 
             all_threads = []
             for page_key in sorted(threads_data.keys(), key=lambda x: int(x.split("_")[1])):
@@ -962,9 +956,8 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
             
             all_articles = [item for sublist in results for item in sublist]
             articles_output = os.path.join(ARTICLES_DIR, f"batch_{idx:02d}_desifakes_articles.json")
-            async with aiopen(articles_output, "w", encoding="utf-8") as f:
-                content = json.dumps(all_articles, indent=2, ensure_ascii=False)
-                await f.write(content)
+            with open(articles_output, "w", encoding="utf-8") as f:
+                json.dump(all_articles, f, indent=2, ensure_ascii=False)
             
             await process_articles_batch(idx, articles_output, MEDIA_DIR)
             
@@ -1009,9 +1002,8 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
         entry["media"] = new_media
     
     # Save to temp file
-    async with aiopen(user_data_file, "w", encoding="utf-8") as f:
-        content = json.dumps(user_data, indent=2, ensure_ascii=False)
-        await f.write(content)
+    with open(user_data_file, "w", encoding="utf-8") as f:
+        json.dump(user_data, f, indent=2, ensure_ascii=False)
     
     # Generate individual HTML
     os.makedirs(HTML_DIR, exist_ok=True)
@@ -1042,8 +1034,8 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
     html_content = create_html(media_by_date_per_username, [user], 2019, 2025)
     
     if html_content:
-        async with aiopen(individual_output, "w", encoding="utf-8") as f:
-            await f.write(html_content)
+        with open(individual_output, "w", encoding="utf-8") as f:
+            f.write(html_content)
     
     del user_data
     del media_by_date
@@ -1101,9 +1093,8 @@ async def handle_message(client: Client, message: Message):
             
             # Check total media for this user
             try:
-                async with aiopen(user_data_file, "r", encoding="utf-8") as f:
-                    content = await f.read()
-                    user_data = json.loads(content)
+                with open(user_data_file, "r", encoding="utf-8") as f:
+                    user_data = json.load(f)
                 total_media = sum(len(entry.get("media", [])) for entry in user_data)
                 if total_media > 0:
                     break
@@ -1166,7 +1157,7 @@ async def handle_message(client: Client, message: Message):
             
             del user_data
             gc.collect()
-            await aioremove(user_data_file)
+            os.remove(user_data_file)
         except Exception as e:
             logger.error(f"Error processing user data file {user_data_file}: {e}")
     
@@ -1175,12 +1166,12 @@ async def handle_message(client: Client, message: Message):
     total_items = sum(len(media_list) for user_media in media_by_date_per_username.values() for media_type in user_media.values() for media_list in media_type.values())
     
     if html_content:
-        async with aiopen(OUTPUT_FILE, "w", encoding="utf-8") as f:
-            await f.write(html_content)
+        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+            f.write(html_content)
         
         # Upload
-        async with aiopen(OUTPUT_FILE, "rb") as f:
-            data = await f.read()
+        with open(OUTPUT_FILE, "rb") as f:
+            data = f.read()
         async with aiohttp.ClientSession() as client:
             tasks = [upload_file(client, h, data) for h in HOSTS]
             results = await asyncio.gather(*tasks)
@@ -1202,7 +1193,7 @@ async def handle_message(client: Client, message: Message):
                 if os.path.isdir(path):
                     await shutil.rmtree(path)
                 elif os.path.isfile(path) and path.endswith(".json"):
-                    await aioremove(path)
+                    os.remove(path)
         except:
             pass
         
