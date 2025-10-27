@@ -8,3 +8,4 @@ tgcrypto==1.2.5
 flask==2.3.3
 aiofiles
 rich==13.3.4
+httpx
