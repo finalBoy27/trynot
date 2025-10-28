@@ -8,3 +8,5 @@ tgcrypto
 flask
 httpx
 rich
+aiofiles
+psutil
