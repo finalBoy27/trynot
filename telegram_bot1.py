@@ -12,19 +12,15 @@ import shutil
 from urllib.parse import urlencode, urljoin
 from selectolax.parser import HTMLParser
 from datetime import datetime
+from pathlib import Path
 from io import BytesIO
 from pyrogram import Client, filters
 from pyrogram.types import Update, Message
 from flask import Flask
 import threading
-import sys
-import aiofiles
 
-# Pre-compiled regex patterns for performance
-COMPILED_URL_PATTERN = re.compile(r'https?://[^\s"\'<>]+')
-COMPILED_STYLE_URL_PATTERN = re.compile(r'url\((.*?)\)', re.IGNORECASE)
-
-logging.basicConfig(stream=sys.stdout, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Health check app
@@ -48,12 +44,12 @@ ORDER = "date"
 NEWER_THAN = "2019"
 OLDER_THAN = "2025"
 TIMEOUT = 10.0
-DELAY_BETWEEN_REQUESTS = 0.3
+DELAY_BETWEEN_REQUESTS = 0.2
 THREADS_DIR = "Scraping/Threads"
 ARTICLES_DIR = "Scraping/Articles"
 MEDIA_DIR = "Scraping/Media"
-MAX_CONCURRENT_WORKERS = 10
-MAX_RETRIES = 5
+MAX_CONCURRENT_WORKERS = 5
+MAX_RETRIES = 3
 RETRY_DELAY = 2
 
 VALID_EXTS = ["jpg", "jpeg", "png", "gif", "webp", "mp4", "mov", "avi", "mkv", "webm"]
@@ -79,10 +75,6 @@ API_HASH = os.getenv("API_HASH", "baee9dd189e1fd1daf0fb7239f7ae704")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8097154751:AAGdE2IBcRElV1w_zHVwGu3N_utMkOyMpn0")
 
 bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
-# ───────────────────────────────
-# 🌟 LOGGING SETUP
-# ───────────────────────────────
 
 # ───────────────────────────────
 # 🧩 UTILITIES
@@ -123,10 +115,8 @@ def get_total_pages(html_str: str):
     tree = HTMLParser(html_str)
     nav = tree.css_first("ul.pageNav-main")
     if not nav:
-        del tree
         return 1
     pages = [int(a.text(strip=True)) for a in nav.css("li.pageNav-page a") if a.text(strip=True).isdigit()]
-    del tree
     return max(pages) if pages else 1
 
 def extract_threads(html_str: str):
@@ -138,7 +128,6 @@ def extract_threads(html_str: str):
             full_link = urljoin(BASE_URL, href)
             if full_link not in threads:
                 threads.append(full_link)
-    del tree
     return threads
 
 # ───────────────────────────────
@@ -155,17 +144,18 @@ async def fetch_page(client, url: str):
 # 📦 THREAD COLLECTOR
 # ───────────────────────────────
 async def process_batch(client, batch_num, start_url, query, title_only):
-    logger.info(f"📦 Batch #{batch_num}: Collecting Threads")
+    logger.info(f"--- Batch #{batch_num}: Collecting Threads ---")
     resp = await fetch_page(client, start_url)
     if not resp["ok"]:
-        logger.error(f"❌ Failed batch start URL")
+        logger.error(f"Failed batch start URL")
         return None, None
 
     search_id = extract_search_id(resp["final_url"]) or INITIAL_SEARCH_ID
     total_pages = get_total_pages(resp["html"])
-    logger.info(f"✓ Found {total_pages} pages | Search ID: {search_id}")
+    logger.info(f"Found {total_pages} pages | Search ID: {search_id}")
 
     batch_data = {}
+
     for page_num in range(1, total_pages + 1):
         match = re.search(r"c\[older_than]=(\d+)", start_url)
         older_than_ts = match.group(1) if match else None
@@ -179,32 +169,33 @@ async def process_batch(client, batch_num, start_url, query, title_only):
 
     next_batch_url = find_view_older_link(result["html"], title_only)
     if next_batch_url:
-        logger.info(f"→ Older results found!")
+        logger.info("Older results found!")
     return batch_data, next_batch_url
 
-async def collect_threads(query, title_only, threads_dir, client):
+async def collect_threads(query, title_only, threads_dir):
     os.makedirs(threads_dir, exist_ok=True)
     start_url = build_search_url(INITIAL_SEARCH_ID, query, NEWER_THAN, OLDER_THAN, title_only=title_only)
     batch_num = 1
     current_url = start_url
     
-    while current_url:
-        batch_data, next_url = await process_batch(client, batch_num, current_url, query, title_only)
-        if not batch_data:
-            break
-        
-        file_name = os.path.join(threads_dir, f"batch_{batch_num:02d}_desifakes_threads.json")
-        with open(file_name, "w", encoding="utf-8") as f:
-            json.dump(batch_data, f, indent=2, ensure_ascii=False)
-        
-        total = sum(len(v) for v in batch_data.values())
-        logger.info(f"✓ Batch #{batch_num}: {total} threads → {file_name}")
-        
-        if not next_url:
-            logger.info("✓ All threads collected")
-            break
-        current_url = next_url
-        batch_num += 1
+    async with httpx.AsyncClient() as client:
+        while current_url:
+            batch_data, next_url = await process_batch(client, batch_num, current_url, query, title_only)
+            if not batch_data:
+                break
+            
+            file_name = os.path.join(threads_dir, f"batch_{batch_num:02d}_desifakes_threads.json")
+            with open(file_name, "w", encoding="utf-8") as f:
+                json.dump(batch_data, f, indent=2, ensure_ascii=False)
+            
+            total = sum(len(v) for v in batch_data.values())
+            logger.info(f"Batch #{batch_num}: {total} threads → {file_name}")
+            
+            if not next_url:
+                logger.info("All threads collected")
+                break
+            current_url = next_url
+            batch_num += 1
 
 # ───────────────────────────────
 # 📺 ARTICLE COLLECTOR
@@ -274,20 +265,22 @@ async def process_thread(client: httpx.AsyncClient, post_url, patterns, semaphor
                 except:
                     pass
             
-            matched.append({
-                "url": post_url_full,
-                "post_id": post_id,
-                "matched": is_match,
-                "post_date": post_date,
-                "article_html": article.html
-            })
+            if is_match:
+                media_urls = extract_media_from_html(article.html)
+                matched.append({
+                    "url": post_url_full,
+                    "post_id": post_id,
+                    "post_date": post_date,
+                    "media": media_urls
+                })
         
-        return [a for a in matched if a["matched"]] or matched
+        return matched
 
-async def process_threads_concurrent(thread_urls, patterns, client):
+async def process_threads_concurrent(thread_urls, patterns):
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
-    tasks = [process_thread(client, url, patterns, semaphore) for url in thread_urls]
-    results = await asyncio.gather(*tasks)
+    async with httpx.AsyncClient() as client:
+        tasks = [process_thread(client, url, patterns, semaphore) for url in thread_urls]
+        results = await asyncio.gather(*tasks)
     return [item for sublist in results for item in sublist]
 
 # ───────────────────────────────
@@ -325,12 +318,12 @@ def extract_media_from_html(raw_html: str):
     
     for node in tree.css("*[style]"):
         style = node.attributes.get("style") or ""
-        for m in COMPILED_STYLE_URL_PATTERN.findall(style):
+        for m in re.findall(r'url\((.*?)\)', style):
             m = m.strip('"\' ')
             if m:
                 urls.add(m)
     
-    for match in COMPILED_URL_PATTERN.findall(html_content):
+    for match in re.findall(r'https?://[^\s"\'<>]+', html_content):
         urls.add(match.strip())
     
     media_urls = []
@@ -341,7 +334,6 @@ def extract_media_from_html(raw_html: str):
                 full_url = urljoin(BASE_URL, u) if u.startswith("/") else u
                 media_urls.append(full_url)
     
-    del tree
     return list(dict.fromkeys(media_urls))
 
 def filter_media(media_list, seen_global):
@@ -357,13 +349,13 @@ def filter_media(media_list, seen_global):
     return filtered
 
 async def process_articles_batch(batch_num, articles_file, media_dir):
-    logger.info(f"🎬 Batch #{batch_num}: Extracting Media")
+    logger.info(f"--- Batch #{batch_num}: Extracting Media ---")
     
     try:
         with open(articles_file, "r", encoding="utf-8") as f:
             articles = json.load(f)
     except Exception as e:
-        logger.error(f"❌ Error reading {articles_file}: {e}")
+        logger.error(f"Error reading {articles_file}: {e}")
         return
     
     articles.sort(key=lambda x: datetime.strptime(x.get("post_date", "1900-01-01"), "%Y-%m-%d"), reverse=True)
@@ -372,9 +364,9 @@ async def process_articles_batch(batch_num, articles_file, media_dir):
     all_media = set()
     no_media_posts = []
     
+    # Removed rich progress bar, using logging instead
     for entry in articles:
-        html_data = entry.get("article_html", "")
-        media_urls = extract_media_from_html(html_data)
+        media_urls = entry.get("media", [])
         media_urls = filter_media(media_urls, all_media)
         
         post_id = entry.get("post_id") or "unknown"
@@ -398,15 +390,13 @@ async def process_articles_batch(batch_num, articles_file, media_dir):
     with open(media_output, "w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2, ensure_ascii=False)
     
-    logger.info(f"✓ Media extracted: {len(all_results)} posts → {media_output}")
-    logger.warning(f"⚠ No media: {len(no_media_posts)} posts")
-    
-    del articles
+    logger.info(f"Media extracted: {len(all_results)} posts → {media_output}")
+    logger.warning(f"No media: {len(no_media_posts)} posts")
 
 # ───────────────────────────────
 # 📄 HTML GENERATOR
 # ───────────────────────────────
-async def create_html_streaming(file_path, media_by_date_per_username, usernames, start_year, end_year):
+def create_html(media_by_date_per_username, usernames, start_year, end_year):
     usernames_str = ", ".join(usernames)
     title = f"{usernames_str} - Media Gallery"
     logger.info(f"Generating HTML for usernames: {usernames_str}")
@@ -453,29 +443,29 @@ async def create_html_streaming(file_path, media_by_date_per_username, usernames
 
     if total_items == 0:
         logger.warning(f"No media items found for {usernames_str}")
-        return False
+        return None
 
     # Check HTML size to prevent truncation
     estimated_size = sum(len(str(item)) for user_items in media_data.values() for item in user_items) / (1024 * 1024)
     if estimated_size > MAX_FILE_SIZE_MB:
         logger.warning(f"Estimated HTML size {estimated_size:.2f} MB exceeds limit of {MAX_FILE_SIZE_MB} MB")
-        return False
+        return None
 
     # Serialize mediaData to JSON to ensure valid structure
     try:
         media_data_json = json.dumps(media_data, ensure_ascii=False, indent=2)
-        del media_data  # Free the dict
-        gc.collect()
     except Exception as e:
         logger.error(f"Failed to serialize mediaData to JSON: {str(e)}")
-        return False
+        return None
+
+    # Clean up
+    del media_by_date_per_username, media_data, media_counts
+    gc.collect()
 
     # Calculate default itemsPerPage
     default_items_per_page = max(1, math.ceil(total_items / MAX_PAGINATION_RANGE))
 
-    async with aiofiles.open(file_path, 'w', encoding='utf-8') as f:
-        # Write HTML in chunks to avoid large strings in memory
-        await f.write(f"""<!DOCTYPE html>
+    html_fragments = [f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -533,28 +523,19 @@ async def create_html_streaming(file_path, media_by_date_per_username, usernames
       <input type="number" id="itemsPerUser" class="number-input" min="1" value="2" placeholder="Items per user">
     </div>
     <input type="number" id="itemsPerPage" class="number-input" min="1" value="{default_items_per_page}" placeholder="Items per page">
-    <button class="filter-button active" data-usernames="" data-original-text="All ({total_items})">All ({total_items})</button>
-""")
-        
-        # Write filter buttons
-        for username in usernames:
-            await f.write(f"""    <button class="filter-button" data-usernames="{html.escape(username.replace(" ", "_"))}" 
-    data-original-text="{html.escape(username)} ({media_counts[username]})">
-    {html.escape(username)} ({media_counts[username]})</button>
-""")
-        
-        await f.write("""  </div>
+    <button class="filter-button active" data-usernames="" data-original-text="All">All ({total_items})</button>
+    {"".join(
+    f'<button class="filter-button" data-usernames="{html.escape(username.replace(" ", "_"))}" '
+    f'data-original-text="{html.escape(username)} ({media_counts[username]})">'
+    f'{html.escape(username)} ({media_counts[username]})</button>'
+    for username in usernames)}
+  </div>
   <div class="pagination" id="pagination"></div>
   <div class="masonry" id="masonry"></div>
   <script>
-""")
-        
-        # Write script variables
-        await f.write("    const mediaData = ")
-        await f.write(media_data_json)
-        await f.write(";\n")
-        await f.write(f"    const usernames = {json.dumps([username.replace(' ', '_') for username in usernames])};\n")
-        await f.write("""    const masonry = document.getElementById("masonry");
+    const mediaData = {media_data_json};
+    const usernames = {json.dumps([username.replace(' ', '_') for username in usernames])};
+    const masonry = document.getElementById("masonry");
     const pagination = document.getElementById("pagination");
     const buttons = document.querySelectorAll('.filter-button');
     const mediaTypeSelect = document.getElementById('mediaType');
@@ -563,181 +544,179 @@ async def create_html_streaming(file_path, media_by_date_per_username, usernames
     let selectedUsername = '';
     window.currentPage = 1;
 
-    function updateButtonLabels() {
-      buttons.forEach(button => {
+    function updateButtonLabels() {{
+      buttons.forEach(button => {{
         const originalText = button.getAttribute('data-original-text');
         button.textContent = originalText;
-      });
-    }
+      }});
+    }}
 
-    function generateVideoThumbnail(videoElement) {
-      videoElement.addEventListener('loadedmetadata', function handleLoadedMetadata() {
-        try {
+    function generateVideoThumbnail(videoElement) {{
+      videoElement.addEventListener('loadedmetadata', function handleLoadedMetadata() {{
+        try {{
           videoElement.currentTime = 0.1;
-        } catch (e) {
+        }} catch (e) {{
           console.error('Error setting currentTime:', e);
-        }
+        }}
         videoElement.removeEventListener('loadedmetadata', handleLoadedMetadata);
-      }, { once: true });
+      }}, {{ once: true }});
 
-      videoElement.addEventListener('seeked', function handleSeeked() {
-        try {
+      videoElement.addEventListener('seeked', function handleSeeked() {{
+        try {{
           const playPromise = videoElement.play();
-          if (playPromise !== undefined) {
-            playPromise.then(() => {
-              setTimeout(() => {
+          if (playPromise !== undefined) {{
+            playPromise.then(() => {{
+              setTimeout(() => {{
                 videoElement.pause();
-              }, 100);
-            }).catch(e => {
+              }}, 100);
+            }}).catch(e => {{
               console.error('Play error:', e);
               videoElement.pause();
-            });
-          } else {
+            }});
+          }} else {{
             videoElement.play();
-            setTimeout(() => {
+            setTimeout(() => {{
               videoElement.pause();
-            }, 100);
-          }
-        } catch (e) {
+            }}, 100);
+          }}
+        }} catch (e) {{
           console.error('Error in play/pause:', e);
-        }
+        }}
         videoElement.removeEventListener('seeked', handleSeeked);
-      }, { once: true });
-    }
+      }}, {{ once: true }});
+    }}
 
-    function getOrderedMedia(mediaType, itemsPerUser, itemsPerPage, page) {
-      try {
+    function getOrderedMedia(mediaType, itemsPerUser, itemsPerPage, page) {{
+      try {{
         let allMedia = [];
-        if (selectedUsername === '') {
+        if (selectedUsername === '') {{
           let maxRounds = 0;
-          const mediaByUser = {};
-          usernames.forEach(username => {
+          const mediaByUser = {{}};
+          usernames.forEach(username => {{
             let userMedia = mediaData[username] || [];
-            if (mediaType !== 'all') {
+            if (mediaType !== 'all') {{
               userMedia = userMedia.filter(item => item.type === mediaType);
-            }
+            }}
             userMedia = userMedia.sort((a, b) => new Date(b.date) - new Date(a.date));
             mediaByUser[username] = userMedia;
             maxRounds = Math.max(maxRounds, Math.ceil(userMedia.length / itemsPerUser));
-          });
-          for (let round = 0; round < maxRounds; round++) {
-            usernames.forEach(username => {
+          }});
+          for (let round = 0; round < maxRounds; round++) {{
+            usernames.forEach(username => {{
               const start = round * itemsPerUser;
               const end = start + itemsPerUser;
               allMedia = allMedia.concat(mediaByUser[username].slice(start, end));
-            });
-          }
+            }});
+          }}
           allMedia = allMedia.filter(item => item);
-        } else {
+        }} else {{
           let userMedia = mediaData[selectedUsername] || [];
-          if (mediaType !== 'all') {
+          if (mediaType !== 'all') {{
             userMedia = userMedia.filter(item => item.type === mediaType);
-          }
+          }}
           allMedia = userMedia.sort((a, b) => new Date(b.date) - new Date(a.date));
-        }
+        }}
         const start = (page - 1) * itemsPerPage;
         const end = start + itemsPerPage;
-        console.log('getOrderedMedia:', { mediaType, itemsPerUser, itemsPerPage, page, start, end, total: allMedia.length });
-        return { media: allMedia.slice(start, end), total: allMedia.length };
-      } catch (e) {
+        console.log('getOrderedMedia:', {{ mediaType, itemsPerUser, itemsPerPage, page, start, end, total: allMedia.length }});
+        return {{ media: allMedia.slice(start, end), total: allMedia.length }};
+      }} catch (e) {{
         console.error('Error in getOrderedMedia:', e);
-        return { media: [], total: 0 };
-      }
-    }
+        return {{ media: [], total: 0 }};
+      }}
+    }}
 
-    function updatePagination(totalItems, itemsPerPage, currentPage) {
-      try {
+    function updatePagination(totalItems, itemsPerPage, currentPage) {{
+      try {{
         pagination.innerHTML = '';
         const totalPages = Math.ceil(totalItems / itemsPerPage);
-        if (totalPages <= 1) {
+        if (totalPages <= 1) {{
           console.log('updatePagination: Only one page, no pagination needed');
           return;
-        }
+        }}
 
-        console.log('updatePagination:', { totalItems, itemsPerPage, currentPage: window.currentPage, totalPages });
+        console.log('updatePagination:', {{ totalItems, itemsPerPage, currentPage: window.currentPage, totalPages }});
 
         const maxButtons = 5;
         let startPage = Math.max(1, window.currentPage - Math.floor(maxButtons / 2));
         let endPage = Math.min(totalPages, startPage + maxButtons - 1);
-        if (endPage - startPage + 1 < maxButtons) {
+        if (endPage - startPage + 1 < maxButtons) {{
           startPage = Math.max(1, endPage - maxButtons + 1);
-        }
+        }}
 
         const prevButton = document.createElement('button');
         prevButton.className = 'pagination-button';
         prevButton.textContent = 'Previous';
         prevButton.disabled = window.currentPage === 1;
-        prevButton.addEventListener('click', () => {
-          if (window.currentPage > 1) {
+        prevButton.addEventListener('click', () => {{
+          if (window.currentPage > 1) {{
             window.currentPage--;
             console.log('Previous button clicked, new currentPage:', window.currentPage);
             renderMedia();
-          }
-        });
+          }}
+        }});
         pagination.appendChild(prevButton);
 
-        for (let i = startPage; i <= endPage; i++) {
+        for (let i = startPage; i <= endPage; i++) {{
           const pageButton = document.createElement('button');
           pageButton.className = 'pagination-button' + (i === window.currentPage ? ' active' : '');
           pageButton.textContent = i;
-          pageButton.addEventListener('click', (function(pageNumber) {
-            return function() {
+          pageButton.addEventListener('click', (function(pageNumber) {{
+            return function() {{
               window.currentPage = pageNumber;
               console.log('Page button clicked, new currentPage:', window.currentPage);
               renderMedia();
-            };
-          })(i));
+            }};
+          }})(i));
           pagination.appendChild(pageButton);
-        }
+        }}
 
         const nextButton = document.createElement('button');
         nextButton.className = 'pagination-button';
         nextButton.textContent = 'Next';
         nextButton.disabled = window.currentPage === totalPages;
-        nextButton.addEventListener('click', () => {
-          if (window.currentPage < totalPages) {
+        nextButton.addEventListener('click', () => {{
+          if (window.currentPage < totalPages) {{
             window.currentPage++;
             console.log('Next button clicked, new currentPage:', window.currentPage);
             renderMedia();
-          }
-        });
+          }}
+        }});
         pagination.appendChild(nextButton);
-      } catch (e) {
+      }} catch (e) {{
         console.error('Error in updatePagination:', e);
-      }
-    }
+      }}
+    }}
 
-    function renderMedia() {
-      try {
+    function renderMedia() {{
+      try {{
         masonry.innerHTML = '';
         const mediaType = mediaTypeSelect.value;
         const itemsPerUser = parseInt(itemsPerUserInput.value) || 2;
-        const itemsPerPage = parseInt(itemsPerPageInput.value) || """)
-        await f.write(str(default_items_per_page))
-        await f.write(""";
+        const itemsPerPage = parseInt(itemsPerPageInput.value) || {default_items_per_page};
         const result = getOrderedMedia(mediaType, itemsPerUser, itemsPerPage, window.currentPage);
         const allMedia = result.media;
         const totalItems = result.total;
-        console.log('renderMedia:', { mediaType, itemsPerUser, itemsPerPage, currentPage: window.currentPage, mediaCount: allMedia.length, totalItems });
+        console.log('renderMedia:', {{ mediaType, itemsPerUser, itemsPerPage, currentPage: window.currentPage, mediaCount: allMedia.length, totalItems }});
         updatePagination(totalItems, itemsPerPage, window.currentPage);
 
         const columnsCount = 3;
         const columns = [];
-        for (let i = 0; i < columnsCount; i++) {
+        for (let i = 0; i < columnsCount; i++) {{
           const col = document.createElement("div");
           col.className = "column";
           masonry.appendChild(col);
           columns.push(col);
-        }
+        }}
 
         const totalRows = Math.ceil(allMedia.length / columnsCount);
-        for (let row = 0; row < totalRows; row++) {
-          for (let col = 0; col < columnsCount; col++) {
+        for (let row = 0; row < totalRows; row++) {{
+          for (let col = 0; col < columnsCount; col++) {{
             const actualCol = row % 2 === 0 ? col : columnsCount - 1 - col;
             const index = row * columnsCount + col;
-            if (index < allMedia.length) {
+            if (index < allMedia.length) {{
               let element;
-              if (allMedia[index].type === "videos") {
+              if (allMedia[index].type === "videos") {{
                 element = document.createElement("video");
                 element.src = allMedia[index].src;
                 element.controls = true;
@@ -745,41 +724,41 @@ async def create_html_streaming(file_path, media_by_date_per_username, usernames
                 element.loading = "lazy";
                 element.preload = "metadata";
                 element.playsInline = true;
-                element.onerror = () => {
+                element.onerror = () => {{
                   console.error('Failed to load video:', allMedia[index].src);
                   element.remove();
-                };
-                element.addEventListener('loadedmetadata', () => {
+                }};
+                element.addEventListener('loadedmetadata', () => {{
                   generateVideoThumbnail(element);
-                }, { once: true });
-              } else {
+                }}, {{ once: true }});
+              }} else {{
                 element = document.createElement("img");
                 element.src = allMedia[index].src;
                 element.alt = allMedia[index].type.charAt(0).toUpperCase() + allMedia[index].type.slice(1);
                 element.loading = "lazy";
-                element.onerror = () => {
+                element.onerror = () => {{
                   console.error('Failed to load image:', allMedia[index].src);
                   element.remove();
-                };
-              }
+                }};
+              }}
               columns[actualCol].appendChild(element);
-            }
-          }
-        }
-        window.scrollTo({ top: 0, behavior: "smooth" });
-      } catch (e) {
+            }}
+          }}
+        }}
+        window.scrollTo({{ top: 0, behavior: "smooth" }});
+      }} catch (e) {{
         console.error('Error in renderMedia:', e);
         masonry.innerHTML = '<p style="color: red;">Error loading media. Please check console for details.</p>';
-      }
-    }
+      }}
+    }}
 
-    buttons.forEach(button => {
-      button.addEventListener('click', () => {
-        try {
+    buttons.forEach(button => {{
+      button.addEventListener('click', () => {{
+        try {{
           const username = button.getAttribute('data-usernames');
-          if (button.classList.contains('active')) {
+          if (button.classList.contains('active')) {{
             return;
-          }
+          }}
           buttons.forEach(btn => btn.classList.remove('active'));
           button.classList.add('active');
           selectedUsername = username;
@@ -787,104 +766,103 @@ async def create_html_streaming(file_path, media_by_date_per_username, usernames
           console.log('Filter button clicked, selectedUsername:', username, 'currentPage:', window.currentPage);
           updateButtonLabels();
           renderMedia();
-        } catch (e) {
+        }} catch (e) {{
           console.error('Error in button click handler:', e);
-        }
-      });
-    });
+        }}
+      }});
+    }});
 
-    mediaTypeSelect.addEventListener('change', () => {
-      try {
+    mediaTypeSelect.addEventListener('change', () => {{
+      try {{
         window.currentPage = 1;
         console.log('Media type changed, resetting currentPage to 1');
         renderMedia();
-      } catch (e) {
+      }} catch (e) {{
         console.error('Error in mediaTypeSelect change handler:', e);
-      }
-    });
+      }}
+    }});
 
-    itemsPerUserInput.addEventListener('input', () => {
-      try {
+    itemsPerUserInput.addEventListener('input', () => {{
+      try {{
         window.currentPage = 1;
         console.log('Items per user changed, resetting currentPage to 1');
         renderMedia();
-      } catch (e) {
+      }} catch (e) {{
         console.error('Error in itemsPerUserInput input handler:', e);
-      }
-    });
+      }}
+    }});
 
-    itemsPerPageInput.addEventListener('input', () => {
-      try {
+    itemsPerPageInput.addEventListener('input', () => {{
+      try {{
         window.currentPage = 1;
         console.log('Items per page changed, resetting currentPage to 1');
         renderMedia();
-      } catch (e) {
+      }} catch (e) {{
         console.error('Error in itemsPerPageInput input handler:', e);
-      }
-    });
+      }}
+    }});
 
-    document.addEventListener('play', function(e) {
+    document.addEventListener('play', function(e) {{
       const videos = document.querySelectorAll("video");
-      videos.forEach(video => {
-        if (video !== e.target) {
+      videos.forEach(video => {{
+        if (video !== e.target) {{
           video.pause();
-        }
-      });
-    }, true);
+        }}
+      }});
+    }}, true);
 
-    try {
+    try {{
       updateButtonLabels();
       renderMedia();
-    } catch (e) {
+    }} catch (e) {{
       console.error('Initial render failed:', e);
       masonry.innerHTML = '<p style="color: red;">Error loading media. Please check console for details.</p>';
-    }
+    }}
   </script>
 </body>
-</html>""")
+</html>"""]
+    
+
+    html_content = "".join(html_fragments)
+    logger.info(f"Generated HTML with {total_items} items, size: {len(html_content) / (1024 * 1024):.2f} MB")
     
     # Clean up temporary data to free memory
     try:
-        del media_data_json
-        media_counts.clear()
-        del media_counts
-        total_type_counts.clear()
-        del total_type_counts
+        html_fragments.clear()
+        del html_fragments
         gc.collect()  # Force garbage collection after HTML generation
-        logger.info("✅ Memory cleaned up after HTML generation")
+        logger.info("Memory cleaned up after HTML generation")
     except Exception as cleanup_error:
         logger.error(f"Error during HTML generation cleanup: {str(cleanup_error)}")
         gc.collect()  # Still attempt garbage collection
     
-    logger.info(f"Generated HTML with {total_items} items, size: {estimated_size:.2f} MB")
-    
-    return True
+    return html_content
 
 # ───────────────────────────────
 # � UPLOAD FUNCTIONS
 # ───────────────────────────────
-async def upload_file(client, host, file_path):
-    with open(file_path, 'rb') as f:
-        files = {host["field"]:(os.path.basename(file_path), f, "text/html")}
-        try:
-            r = await client.post(host["url"], files=files, data=host.get("data", {}), timeout=30.0)
-            if r.status_code in (200,201):
-                if host["name"]=="HTML Hosting":
-                    j = r.json()
-                    if j.get("success") and j.get("url"):
-                        return (host["name"], j["url"])
-                    else:
-                        return (host["name"], f"Error: {j.get('error','Unknown')}")
+async def upload_file(client, host, data):
+    buf = BytesIO(data)
+    files = {host["field"]:(UPLOAD_FILE, buf, "text/html")}
+    try:
+        r = await client.post(host["url"], files=files, data=host.get("data", {}), timeout=30.0)
+        if r.status_code in (200,201):
+            if host["name"]=="HTML Hosting":
+                j = r.json()
+                if j.get("success") and j.get("url"):
+                    return (host["name"], j["url"])
                 else:
-                    t = r.text.strip()
-                    if t.startswith("https://"):
-                        if host["name"]=="Litterbox" and "files.catbox.moe" in t:
-                            t = "https://litterbox.catbox.moe/"+t.split("/")[-1]
-                        return (host["name"], t)
-                    return (host["name"], f"Invalid response: {t[:100]}")
-            return (host["name"], f"HTTP {r.status_code}")
-        except Exception as e:
-            return (host["name"], f"Exception: {e}")
+                    return (host["name"], f"Error: {j.get('error','Unknown')}")
+            else:
+                t = r.text.strip()
+                if t.startswith("https://"):
+                    if host["name"]=="Litterbox" and "files.catbox.moe" in t:
+                        t = "https://litterbox.catbox.moe/"+t.split("/")[-1]
+                    return (host["name"], t)
+                return (host["name"], f"Invalid response: {t[:100]}")
+        return (host["name"], f"HTTP {r.status_code}")
+    except Exception as e:
+        return (host["name"], f"Exception: {e}")
 
 # ───────────────────────────────
 # PROGRESS BAR
@@ -897,8 +875,8 @@ def generate_bar(percentage):
 # ───────────────────────────────
 # PROCESS USER
 # ───────────────────────────────
-async def process_user(user, title_only, user_idx, total_users, progress_msg, last_edit, client):
-    logger.info(f"🔍 Processing user: {user}")
+async def process_user(user, title_only, user_idx, total_users, progress_msg, last_edit):
+    logger.info(f"Processing user: {user}")
     
     search_display = "+".join(user.split())
     tokens = [t for t in re.split(r"[,\s]+", user) if t]
@@ -927,7 +905,7 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
         last_edit[0] = now
     
     # Phase 1: Collect threads
-    await collect_threads(search_display, title_only, THREADS_DIR, client)
+    await collect_threads(search_display, title_only, THREADS_DIR)
     
     # Update progress
     progress += 20 / total_users
@@ -948,12 +926,11 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
         all_threads = []
         for page_key in sorted(threads_data.keys(), key=lambda x: int(x.split("_")[1])):
             all_threads.extend(threads_data[page_key])
-        
-        del threads_data
-        
+
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
-        tasks = [process_thread(client, url, PATTERNS, semaphore) for url in all_threads]
-        results = await asyncio.gather(*tasks)
+        async with httpx.AsyncClient() as client:
+            tasks = [process_thread(client, url, PATTERNS, semaphore) for url in all_threads]
+            results = await asyncio.gather(*tasks)
         
         all_articles = [item for sublist in results for item in sublist]
         articles_output = os.path.join(ARTICLES_DIR, f"batch_{idx:02d}_desifakes_articles.json")
@@ -961,8 +938,9 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
             json.dump(all_articles, f, indent=2, ensure_ascii=False)
         
         await process_articles_batch(idx, articles_output, MEDIA_DIR)
-        
-        del all_articles
+    
+        # Clean up after each batch
+        del threads_data, all_threads, results, all_articles
         gc.collect()
     
     # Update progress
@@ -994,6 +972,10 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
                 new_media.append(url)
         entry["media"] = new_media
     
+    # Clean up
+    del media_files, seen_urls
+    gc.collect()
+    
     # Generate individual HTML
     os.makedirs(HTML_DIR, exist_ok=True)
     individual_output = os.path.join(HTML_DIR, f"{user_idx+1:02d}_{user_safe}.html")
@@ -1020,10 +1002,15 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
             media_by_date[typ][date].append(url)
     
     media_by_date_per_username = {user: media_by_date}
-    success = await create_html_streaming(individual_output, media_by_date_per_username, [user], 2019, 2025)
+    html_content = create_html(media_by_date_per_username, [user], 2019, 2025)
     
-    if success:
-        pass
+    if html_content:
+        with open(individual_output, "w", encoding="utf-8") as f:
+            f.write(html_content)
+    
+    # Clean up
+    del media_by_date, media_by_date_per_username, html_content
+    gc.collect()
     
     # Update progress
     progress += 20 / total_users
@@ -1063,108 +1050,91 @@ async def handle_message(client: Client, message: Message):
         return
     
     total_users = len(usernames)
-    temp_files = []
+    all_data = []
     last_edit = [0]
     
     # Send initial progress message
     progress_msg = await message.reply("Starting processing...")
     
-    # Create shared httpx client
-    httpx_client = httpx.AsyncClient(limits=httpx.Limits(max_connections=10, max_keepalive_connections=5), timeout=TIMEOUT)
-    
-    try:
-        for user_idx, user in enumerate(usernames):
-            user_data = await process_user(user, title_only, user_idx, total_users, progress_msg, last_edit, httpx_client)
-            temp_file = f"temp_user_{user_idx}.json"
-            with open(temp_file, 'w') as f:
-                json.dump(user_data, f)
-            temp_files.append(temp_file)
-            del user_data
-            gc.collect()
-        
-        # Final progress
-        progress = 100
-        bar = generate_bar(progress)
-        msg = f"completed {total_users}/{total_users}\n{bar} {progress:.2f}%\nGenerating final gallery..."
-        await progress_msg.edit(msg)
-        
-        # Generate final
-        media_by_date_per_username = {u: {"images": {}, "videos": {}, "gifs": {}} for u in usernames}
-        
-        seen_urls = set()
-        for temp_file in temp_files:
-            with open(temp_file, 'r') as f:
-                user_data = json.load(f)
-            for entry in user_data:
-                user = entry["username"]
-                date = entry.get("post_date", "")
-                if not date:
-                    continue
-                for url in entry.get("media", []):
-                    if url in seen_urls:
-                        continue
-                    seen_urls.add(url)
-                    if 'vh/dl?url' in url:
-                        typ = 'videos'
-                    elif 'vh/dli?' in url:
-                        typ = 'images'
-                    else:
-                        if '.mp4' in url.lower():
-                            typ = 'videos'
-                        elif '.gif' in url.lower():
-                            typ = 'gifs'
-                        else:
-                            typ = 'images'
-                    if date not in media_by_date_per_username[user][typ]:
-                        media_by_date_per_username[user][typ][date] = []
-                    media_by_date_per_username[user][typ][date].append(url)
-            del user_data
-            gc.collect()
-        
-        success = await create_html_streaming(OUTPUT_FILE, media_by_date_per_username, usernames, 2019, 2025)
-        
-        total_items = sum(len(media_list) for user_media in media_by_date_per_username.values() for media_type in user_media.values() for media_list in media_type.values())
-        
+    for user_idx, user in enumerate(usernames):
+        user_data = await process_user(user, title_only, user_idx, total_users, progress_msg, last_edit)
+        all_data.extend(user_data)
+        del user_data
         gc.collect()
+    
+    # Final progress
+    progress = 100
+    bar = generate_bar(progress)
+    msg = f"completed {total_users}/{total_users}\n{bar} {progress:.2f}%\nGenerating final gallery..."
+    await progress_msg.edit(msg)
+    
+    # Generate final
+    media_by_date_per_username = {u: {"images": {}, "videos": {}, "gifs": {}} for u in usernames}
+    
+    seen_urls = set()
+    for entry in all_data:
+        user = entry["username"]
+        date = entry.get("post_date", "")
+        if not date:
+            continue
+        for url in entry.get("media", []):
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            if 'vh/dl?url' in url:
+                typ = 'videos'
+            elif 'vh/dli?' in url:
+                typ = 'images'
+            else:
+                if '.mp4' in url.lower():
+                    typ = 'videos'
+                elif '.gif' in url.lower():
+                    typ = 'gifs'
+                else:
+                    typ = 'images'
+            if date not in media_by_date_per_username[user][typ]:
+                media_by_date_per_username[user][typ][date] = []
+            media_by_date_per_username[user][typ][date].append(url)
+    
+    html_content = create_html(media_by_date_per_username, usernames, 2019, 2025)
+    
+    total_items = sum(len(media_list) for user_media in media_by_date_per_username.values() for media_type in user_media.values() for media_list in media_type.values())
+    
+    if html_content:
+        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+            f.write(html_content)
         
-        if success:
-            # Upload
-            tasks = [upload_file(httpx_client, h, OUTPUT_FILE) for h in HOSTS]
+        # Upload
+        with open(OUTPUT_FILE, "rb") as f:
+            data = f.read()
+        async with httpx.AsyncClient() as client:
+            tasks = [upload_file(client, h, data) for h in HOSTS]
             results = await asyncio.gather(*tasks)
-            
-            links = []
-            for name, res in results:
-                status = "✅" if res.startswith("https://") else "❌"
-                links.append(f"{status} {name}: {res}")
-            
-            caption = f"Total Media in Html: {total_items}\n───────────────────────────────────\n📤 Uploading Final HTML to Hosting Services\n" + "\n".join(links)
-            
-            await message.reply_document(OUTPUT_FILE, caption=caption)
-            
-            # Delete progress message after sending the final gallery
-            await progress_msg.delete()
-            
-            # Clean up
-            try:
-                for item in os.listdir("Scraping"):
-                    path = os.path.join("Scraping", item)
-                    if os.path.isdir(path):
-                        shutil.rmtree(path)
-                    elif os.path.isfile(path) and path.endswith(".json"):
-                        os.remove(path)
-            except:
-                pass
-        else:
-            await message.reply("Failed to generate HTML")
         
-        # Clean up temp files
-        for temp_file in temp_files:
-            try:
-                os.remove(temp_file)
-            except:
-                pass
-    finally:
-        await httpx_client.aclose()
+        links = []
+        for name, res in results:
+            status = "✅" if res.startswith("https://") else "❌"
+            links.append(f"{status} {name}: {res}")
+        
+        caption = f"Total Media in Html: {total_items}\n───────────────────────────────────\n📤 Uploading Final HTML to Hosting Services\n" + "\n".join(links)
+        
+        await message.reply_document(OUTPUT_FILE, caption=caption)
+        
+        # Delete progress message after sending the final gallery
+        await progress_msg.delete()
+        
+        # Clean up
+        try:
+            for item in os.listdir("Scraping"):
+                path = os.path.join("Scraping", item)
+                if os.path.isdir(path):
+                    shutil.rmtree(path)
+                elif os.path.isfile(path) and path.endswith(".json"):
+                    os.remove(path)
+        except:
+            pass
+    else:
+        await message.reply("Failed to generate HTML")
 
 # ───────────────────────────────
 # MAIN
