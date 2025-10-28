@@ -23,6 +23,11 @@ import threading
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Suppress noisy logs
+logging.getLogger('werkzeug').setLevel(logging.ERROR)
+logging.getLogger('pyrogram').setLevel(logging.WARNING)
+logging.getLogger('httpx').setLevel(logging.WARNING)
+
 # Health check app
 app = Flask(__name__)
 
@@ -33,8 +38,6 @@ def health():
 def run_flask():
     app.run(host='0.0.0.0', port=int(os.getenv("PORT", 8080)))
 
-threading.Thread(target=run_flask, daemon=True).start()
-
 # ───────────────────────────────
 # ⚙️ CONFIG
 # ───────────────────────────────
@@ -44,7 +47,7 @@ ORDER = "date"
 NEWER_THAN = "2019"
 OLDER_THAN = "2025"
 TIMEOUT = 10.0
-DELAY_BETWEEN_REQUESTS = 0.3
+DELAY_BETWEEN_REQUESTS = 0.2
 THREADS_DIR = "Scraping/Threads"
 ARTICLES_DIR = "Scraping/Articles"
 MEDIA_DIR = "Scraping/Media"
@@ -458,10 +461,6 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
         logger.error(f"Failed to serialize mediaData to JSON: {str(e)}")
         return None
 
-    # Clean up
-    del media_by_date_per_username, media_data, media_counts
-    gc.collect()
-
     # Calculate default itemsPerPage
     default_items_per_page = max(1, math.ceil(total_items / MAX_PAGINATION_RANGE))
 
@@ -826,6 +825,10 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
     html_content = "".join(html_fragments)
     logger.info(f"Generated HTML with {total_items} items, size: {len(html_content) / (1024 * 1024):.2f} MB")
     
+    # Clean up
+    del media_by_date_per_username, media_data, media_counts
+    gc.collect()
+
     # Clean up temporary data to free memory
     try:
         html_fragments.clear()
