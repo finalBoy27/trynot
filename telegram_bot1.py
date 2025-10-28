@@ -48,12 +48,12 @@ ORDER = "date"
 NEWER_THAN = "2019"
 OLDER_THAN = "2025"
 TIMEOUT = 10.0
-DELAY_BETWEEN_REQUESTS = 0.2
+DELAY_BETWEEN_REQUESTS = 0.3
 THREADS_DIR = "Scraping/Threads"
 ARTICLES_DIR = "Scraping/Articles"
 MEDIA_DIR = "Scraping/Media"
 MAX_CONCURRENT_WORKERS = 10
-MAX_RETRIES = 3
+MAX_RETRIES = 5
 RETRY_DELAY = 2
 
 VALID_EXTS = ["jpg", "jpeg", "png", "gif", "webp", "mp4", "mov", "avi", "mkv", "webm"]
