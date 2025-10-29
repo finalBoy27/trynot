@@ -8,7 +8,7 @@ import html
 import math
 import gc
 import logging
-import aioshutil
+import shutil
 from urllib.parse import urlencode, urljoin
 from selectolax.parser import HTMLParser
 from datetime import datetime
@@ -16,29 +16,20 @@ from pathlib import Path
 from io import BytesIO
 from pyrogram import Client, filters
 from pyrogram.types import Update, Message
-from fastapi import FastAPI
-import uvicorn
+from flask import Flask
 import threading
-import aiosqlite
 
 # Health check app
-app = FastAPI()
+app = Flask(__name__)
 
-@app.get('/')
-def root():
-    return {"status": "OK"}
-
-@app.get('/health')
+@app.route('/health')
 def health():
-    return {"status": "OK"}
+    return 'OK'
 
-def run_fastapi():
-    uvicorn.run(app, host='0.0.0.0', port=int(os.getenv("PORT", 10000)))
+def run_flask():
+    app.run(host='0.0.0.0', port=int(os.getenv("PORT", 8080)))
 
-# Disable FastAPI logs if needed, but for now keep
-# logging.getLogger('uvicorn').disabled = True  # optional
-
-threading.Thread(target=run_fastapi, daemon=True).start()
+threading.Thread(target=run_flask, daemon=True).start()
 
 # ───────────────────────────────
 # ⚙️ CONFIG
@@ -49,10 +40,10 @@ ORDER = "date"
 NEWER_THAN = "2019"
 OLDER_THAN = "2025"
 TIMEOUT = 10.0
-DELAY_BETWEEN_REQUESTS = 0.25
-TEMP_DB = "Scraping/tempMedia.db"
-MAX_CONCURRENT_WORKERS = 20  # Reduced for memory
-MAX_RETRIES = 4
+DELAY_BETWEEN_REQUESTS = 0.2
+TEMP_MEDIA_FILE = "Scraping/tempMedia.json"
+MAX_CONCURRENT_WORKERS = 5  # Reduced for memory
+MAX_RETRIES = 3
 RETRY_DELAY = 2
 
 VALID_EXTS = ["jpg", "jpeg", "png", "gif", "webp", "mp4", "mov", "avi", "mkv", "webm"]
@@ -374,16 +365,6 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
         logger.error(f"Failed to serialize mediaData to JSON: {str(e)}")
         return None
 
-    # Compute year counts
-    year_counts = {}
-    for username, media_list in media_data.items():
-        for item in media_list:
-            year = item['date'].split('-')[0]
-            if year not in year_counts:
-                year_counts[year] = 0
-            year_counts[year] += 1
-    year_counts_json = json.dumps(year_counts)
-
     # Calculate default itemsPerPage
     default_items_per_page = max(1, math.ceil(total_items / MAX_PAGINATION_RANGE))
 
@@ -441,9 +422,6 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
       <option value="videos">Videos ({total_type_counts['videos']})</option>
       <option value="gifs">Gifs ({total_type_counts['gifs']})</option>
     </select>
-    <select id="yearSelect" class="media-type-select">
-      <option value="all" selected>All ({total_items})</option>
-    </select>
     <div id="itemsPerUserContainer">
       <input type="number" id="itemsPerUser" class="number-input" min="1" value="2" placeholder="Items per user">
     </div>
@@ -460,20 +438,10 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
   <script>
     const mediaData = {media_data_json};
     const usernames = {json.dumps([username.replace(' ', '_') for username in usernames])};
-    const yearCounts = {year_counts_json};
     const masonry = document.getElementById("masonry");
     const pagination = document.getElementById("pagination");
     const buttons = document.querySelectorAll('.filter-button');
     const mediaTypeSelect = document.getElementById('mediaType');
-    const yearSelect = document.getElementById('yearSelect');
-    yearSelect.innerHTML = '<option value="all" selected>All (' + Object.values(yearCounts).reduce((a,b)=>a+b,0) + ')</option>';
-    const sortedYears = Object.keys(yearCounts).sort((a,b)=>b-a);
-    sortedYears.forEach(year => {{
-      const option = document.createElement('option');
-      option.value = year;
-      option.textContent = year + ' (' + yearCounts[year] + ')';
-      yearSelect.appendChild(option);
-    }});
     const itemsPerUserInput = document.getElementById('itemsPerUser');
     const itemsPerPageInput = document.getElementById('itemsPerPage');
     let selectedUsername = '';
@@ -521,7 +489,7 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
       }}, {{ once: true }});
     }}
 
-    function getOrderedMedia(mediaType, itemsPerUser, itemsPerPage, page, yearFilter) {{
+    function getOrderedMedia(mediaType, itemsPerUser, itemsPerPage, page) {{
       try {{
         let allMedia = [];
         if (selectedUsername === '') {{
@@ -531,9 +499,6 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
             let userMedia = mediaData[username] || [];
             if (mediaType !== 'all') {{
               userMedia = userMedia.filter(item => item.type === mediaType);
-            }}
-            if (yearFilter !== 'all') {{
-              userMedia = userMedia.filter(item => item.date.startsWith(yearFilter));
             }}
             userMedia = userMedia.sort((a, b) => new Date(b.date) - new Date(a.date));
             mediaByUser[username] = userMedia;
@@ -552,14 +517,11 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
           if (mediaType !== 'all') {{
             userMedia = userMedia.filter(item => item.type === mediaType);
           }}
-          if (yearFilter !== 'all') {{
-            userMedia = userMedia.filter(item => item.date.startsWith(yearFilter));
-          }}
           allMedia = userMedia.sort((a, b) => new Date(b.date) - new Date(a.date));
         }}
         const start = (page - 1) * itemsPerPage;
         const end = start + itemsPerPage;
-        console.log('getOrderedMedia:', {{ mediaType, itemsPerUser, itemsPerPage, page, yearFilter, start, end, total: allMedia.length }});
+        console.log('getOrderedMedia:', {{ mediaType, itemsPerUser, itemsPerPage, page, start, end, total: allMedia.length }});
         return {{ media: allMedia.slice(start, end), total: allMedia.length }};
       }} catch (e) {{
         console.error('Error in getOrderedMedia:', e);
@@ -633,13 +595,12 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
       try {{
         masonry.innerHTML = '';
         const mediaType = mediaTypeSelect.value;
-        const yearFilter = yearSelect.value;
         const itemsPerUser = parseInt(itemsPerUserInput.value) || 2;
         const itemsPerPage = parseInt(itemsPerPageInput.value) || {default_items_per_page};
-        const result = getOrderedMedia(mediaType, itemsPerUser, itemsPerPage, window.currentPage, yearFilter);
+        const result = getOrderedMedia(mediaType, itemsPerUser, itemsPerPage, window.currentPage);
         const allMedia = result.media;
         const totalItems = result.total;
-        console.log('renderMedia:', {{ mediaType, yearFilter, itemsPerUser, itemsPerPage, currentPage: window.currentPage, mediaCount: allMedia.length, totalItems }});
+        console.log('renderMedia:', {{ mediaType, itemsPerUser, itemsPerPage, currentPage: window.currentPage, mediaCount: allMedia.length, totalItems }});
         updatePagination(totalItems, itemsPerPage, window.currentPage);
 
         const columnsCount = 3;
@@ -721,16 +682,6 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
         renderMedia();
       }} catch (e) {{
         console.error('Error in mediaTypeSelect change handler:', e);
-      }}
-    }});
-
-    yearSelect.addEventListener('change', () => {{
-      try {{
-        window.currentPage = 1;
-        console.log('Year changed, resetting currentPage to 1');
-        renderMedia();
-      }} catch (e) {{
-        console.error('Error in yearSelect change handler:', e);
       }}
     }});
 
@@ -844,6 +795,7 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
         PATTERNS.append(re.compile(r"\b" + re.escape(tok) + r"\b", re.IGNORECASE))
     
     os.makedirs("Scraping", exist_ok=True)
+    temp_media_file = TEMP_MEDIA_FILE
     
     # Update progress: start
     progress = (user_idx / total_users) * 100
@@ -854,86 +806,70 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
         await progress_msg.edit(msg)
         last_edit[0] = now
     
-    async with aiosqlite.connect(TEMP_DB) as db:
-        await db.execute('''CREATE TABLE IF NOT EXISTS media (
-            id INTEGER PRIMARY KEY,
-            username TEXT,
-            post_date TEXT,
-            media_url TEXT UNIQUE,
-            media_type TEXT
-        )''')
-        await db.commit()
-        
-        start_url = build_search_url(INITIAL_SEARCH_ID, search_display, NEWER_THAN, OLDER_THAN, title_only=title_only)
-        batch_num = 1
-        current_url = start_url
-        
-        async with httpx.AsyncClient() as client:
-            while current_url:
-                resp = await fetch_page(client, current_url)
-                if not resp["ok"]:
-                    logger.error(f"Failed batch start URL {current_url}")
-                    break
-                
-                search_id = extract_search_id(resp["final_url"]) or INITIAL_SEARCH_ID
-                total_pages = get_total_pages(resp["html"])
-                logger.info(f"Batch {batch_num}: {total_pages} pages, search_id {search_id}")
-                
-                for page_num in range(1, total_pages + 1):
-                    match = re.search(r"c\[older_than]=(\d+)", current_url)
-                    older_than_ts = match.group(1) if match else None
-                    page_url = build_search_url(search_id, search_display, NEWER_THAN, OLDER_THAN, page_num, 
-                                               None if batch_num == 1 else older_than_ts, title_only)
-                    result = await fetch_page(client, page_url)
-                    if not result["ok"]:
-                        logger.error(f"Failed page {page_num}")
-                        continue
-                    
-                    threads = extract_threads(result["html"])
-                    if not threads:
-                        continue
-                    
-                    # Process articles
-                    articles = await process_threads_concurrent(threads, PATTERNS)
-                    
-                    # Extract media and insert into DB
-                    for article in articles:
-                        html_data = article.get("article_html", "")
-                        media_urls = extract_media_from_html(html_data)
-                        media_urls = filter_media(media_urls, set())  # local dedup per page
-                        for url in media_urls:
-                            if 'vh/dl?url' in url:
-                                typ = 'videos'
-                            elif 'vh/dli?' in url:
-                                typ = 'images'
-                            else:
-                                if '.mp4' in url.lower():
-                                    typ = 'videos'
-                                elif '.gif' in url.lower():
-                                    typ = 'gifs'
-                                else:
-                                    typ = 'images'
-                            await db.execute('INSERT OR IGNORE INTO media (username, post_date, media_url, media_type) VALUES (?, ?, ?, ?)', 
-                                           (user, article['post_date'], url, typ))
-                    
-                    await db.commit()  # Commit after each page
-                    
-                    # Clear memory
-                    del threads, articles
-                    gc.collect()
-                    log_memory()
-                    await asyncio.sleep(DELAY_BETWEEN_REQUESTS)
-                
-                # Next batch
-                next_url = find_view_older_link(result["html"], title_only)
-                if not next_url:
-                    break
-                current_url = next_url
-                batch_num += 1
+    start_url = build_search_url(INITIAL_SEARCH_ID, search_display, NEWER_THAN, OLDER_THAN, title_only=title_only)
+    batch_num = 1
+    current_url = start_url
     
-    # Clean up after processing user
-    gc.collect()
-    log_memory()
+    async with httpx.AsyncClient() as client:
+        while current_url:
+            resp = await fetch_page(client, current_url)
+            if not resp["ok"]:
+                logger.error(f"Failed batch start URL {current_url}")
+                break
+            
+            search_id = extract_search_id(resp["final_url"]) or INITIAL_SEARCH_ID
+            total_pages = get_total_pages(resp["html"])
+            logger.info(f"Batch {batch_num}: {total_pages} pages, search_id {search_id}")
+            
+            for page_num in range(1, total_pages + 1):
+                match = re.search(r"c\[older_than]=(\d+)", current_url)
+                older_than_ts = match.group(1) if match else None
+                page_url = build_search_url(search_id, search_display, NEWER_THAN, OLDER_THAN, page_num, 
+                                           None if batch_num == 1 else older_than_ts, title_only)
+                result = await fetch_page(client, page_url)
+                if not result["ok"]:
+                    logger.error(f"Failed page {page_num}")
+                    continue
+                
+                threads = extract_threads(result["html"])
+                if not threads:
+                    continue
+                
+                # Process articles
+                articles = await process_threads_concurrent(threads, PATTERNS)
+                
+                # Extract media
+                media_entries = []
+                for article in articles:
+                    html_data = article.get("article_html", "")
+                    media_urls = extract_media_from_html(html_data)
+                    media_urls = filter_media(media_urls, set())  # local dedup per page
+                    if media_urls:
+                        media_entries.append({
+                            "username": user,
+                            "post_date": article.get("post_date", ""),
+                            "media": media_urls
+                        })
+                
+                # Append to tempMedia.json
+                if media_entries:
+                    with open(temp_media_file, "a", encoding="utf-8") as f:
+                        for entry in media_entries:
+                            json.dump(entry, f, ensure_ascii=False)
+                            f.write("\n")
+                
+                # Clear memory
+                del threads, articles, media_entries
+                gc.collect()
+                log_memory()
+                await asyncio.sleep(DELAY_BETWEEN_REQUESTS)
+            
+            # Next batch
+            next_url = find_view_older_link(result["html"], title_only)
+            if not next_url:
+                break
+            current_url = next_url
+            batch_num += 1
     
     # Update progress
     progress += 100 / total_users
@@ -977,40 +913,59 @@ async def handle_message(client: Client, message: Message):
     msg = f"completed {total_users}/{total_users}\n{bar} {progress:.2f}%\nDeduplicating and generating final gallery..."
     await progress_msg.edit(msg)
     
-    # Query media from DB
-    logger.info("Querying media from database")
+    # Deduplicate
+    logger.info("Deduplicating media")
     log_memory()
-    async with aiosqlite.connect(TEMP_DB) as db:
-        cursor = await db.execute('SELECT username, post_date, media_url, media_type FROM media')
-        rows = await cursor.fetchall()
+    seen_urls = set()
+    deduped = []
     
-    logger.info(f"Retrieved {len(rows)} media items from database")
+    if os.path.exists(TEMP_MEDIA_FILE):
+        with open(TEMP_MEDIA_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                entry = json.loads(line.strip())
+                new_media = []
+                for url in entry.get("media", []):
+                    if url not in seen_urls:
+                        seen_urls.add(url)
+                        new_media.append(url)
+                if new_media:
+                    entry["media"] = new_media
+                    deduped.append(entry)
+    
+    logger.info(f"Deduped to {len(deduped)} entries, {len(seen_urls)} unique URLs")
     log_memory()
     
     # Build media_by_date_per_username
     media_by_date_per_username = {}
-    for row in rows:
-        user, date, url, typ = row
+    for entry in deduped:
+        user = entry["username"]
         if user not in media_by_date_per_username:
             media_by_date_per_username[user] = {"images": {}, "videos": {}, "gifs": {}}
-        if date not in media_by_date_per_username[user][typ]:
-            media_by_date_per_username[user][typ][date] = []
-        media_by_date_per_username[user][typ][date].append(url)
-    
-    # Clean up rows to free memory
-    del rows
-    gc.collect()
-    log_memory()
+        date = entry.get("post_date", "")
+        if not date:
+            continue
+        for url in entry.get("media", []):
+            if 'vh/dl?url' in url:
+                typ = 'videos'
+            elif 'vh/dli?' in url:
+                typ = 'images'
+            else:
+                if '.mp4' in url.lower():
+                    typ = 'videos'
+                elif '.gif' in url.lower():
+                    typ = 'gifs'
+                else:
+                    typ = 'images'
+            if date not in media_by_date_per_username[user][typ]:
+                media_by_date_per_username[user][typ][date] = []
+            media_by_date_per_username[user][typ][date].append(url)
     
     # Generate HTML
     html_content = create_html(media_by_date_per_username, usernames, 2019, 2025)
     
     total_items = sum(len(media_list) for user_media in media_by_date_per_username.values() for media_type in user_media.values() for media_list in media_type.values())
-    
-    # Clean up media_by_date_per_username to free memory
-    del media_by_date_per_username
-    gc.collect()
-    log_memory()
     
     if html_content:
         with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
@@ -1037,9 +992,9 @@ async def handle_message(client: Client, message: Message):
         
         # Clean up
         try:
-            if os.path.exists(TEMP_DB):
-                await asyncio.to_thread(os.remove, TEMP_DB)
-            await aioshutil.rmtree("Scraping")
+            if os.path.exists(TEMP_MEDIA_FILE):
+                os.remove(TEMP_MEDIA_FILE)
+            shutil.rmtree("Scraping")
         except Exception as e:
             logger.error(f"Cleanup error: {e}")
     else:
@@ -1049,5 +1004,5 @@ async def handle_message(client: Client, message: Message):
 # MAIN
 # ───────────────────────────────
 if __name__ == "__main__":
-    threading.Thread(target=run_fastapi, daemon=True).start()
+    threading.Thread(target=run_flask, daemon=True).start()
     bot.run()
