@@ -51,8 +51,8 @@ OLDER_THAN = "2025"
 TIMEOUT = 10.0
 DELAY_BETWEEN_REQUESTS = 0.2
 TEMP_DB = "Scraping/tempMedia.db"
-MAX_CONCURRENT_WORKERS = 10  # Reduced for memory
-MAX_RETRIES = 3
+MAX_CONCURRENT_WORKERS = 5  # Reduced for memory
+MAX_RETRIES = 4
 RETRY_DELAY = 2
 
 VALID_EXTS = ["jpg", "jpeg", "png", "gif", "webp", "mp4", "mov", "avi", "mkv", "webm"]
