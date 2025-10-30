@@ -48,12 +48,12 @@ INITIAL_SEARCH_ID = "46509052"
 ORDER = "date"
 NEWER_THAN = "2019"
 OLDER_THAN = "2025"
-TIMEOUT = 10.0
-DELAY_BETWEEN_REQUESTS = 0.2
+TIMEOUT = [5.0, 10.0, 15.0]
+DELAY_BETWEEN_REQUESTS = 0.3
 TEMP_DB = "Scraping/tempMedia.db"
-MAX_CONCURRENT_WORKERS = 10  # Reduced for memory
-MAX_RETRIES = 4
-RETRY_DELAY = 0.5
+MAX_CONCURRENT_WORKERS = 8  # Reduced for memory
+MAX_RETRIES = 3
+RETRY_DELAY = [1.0, 1.5, 2.0]
 
 VALID_EXTS = ["jpg", "jpeg", "png", "gif", "webp", "mp4", "mov", "avi", "mkv", "webm"]
 EXCLUDE_PATTERNS = ["/data/avatars/", "/data/assets/", "/data/addonflare/"]
@@ -150,12 +150,17 @@ def extract_threads(html_str: str):
 # 🌐 FETCH
 # ───────────────────────────────
 async def fetch_page(client, url: str):
-    try:
-        r = await client.get(url, follow_redirects=True, timeout=TIMEOUT)
-        return {"ok": r.status_code == 200, "html": r.text, "final_url": str(r.url)}
-    except Exception as e:
-        logger.error(f"Fetch error for {url}: {e}")
-        return {"ok": False, "html": "", "final_url": url}
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            r = await client.get(url, follow_redirects=True, timeout=TIMEOUT[attempt-1])
+            return {"ok": r.status_code == 200, "html": r.text, "final_url": str(r.url)}
+        except Exception as e:
+            logger.error(f"Fetch attempt {attempt} failed for {url}: {e}")
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(RETRY_DELAY[attempt-1])
+            else:
+                logger.error(f"All retries failed for {url}")
+                return {"ok": False, "html": "", "final_url": url}
 
 # ───────────────────────────────
 # 📦 ARTICLE PROCESSOR WITH RETRIES
@@ -163,13 +168,13 @@ async def fetch_page(client, url: str):
 async def make_request(client: httpx.AsyncClient, url: str, retries=MAX_RETRIES) -> str:
     for attempt in range(1, retries + 1):
         try:
-            resp = await client.get(url, follow_redirects=True, timeout=TIMEOUT)
+            resp = await client.get(url, follow_redirects=True, timeout=TIMEOUT[attempt-1])
             resp.raise_for_status()
             return resp.text
         except Exception as e:
             logger.warning(f"Attempt {attempt} failed for {url}: {e}")
             if attempt < retries:
-                await asyncio.sleep(RETRY_DELAY)
+                await asyncio.sleep(RETRY_DELAY[attempt-1])
             else:
                 logger.error(f"All retries failed for {url}")
                 return ""
@@ -325,7 +330,7 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
     total_type_counts = {'images': 0, 'videos': 0, 'gifs': 0}
     
     for username in usernames:
-        media_by_date = media_by_date_per_username[username]
+        media_by_date = media_by_date_per_username.get(username, {"images": {}, "videos": {}, "gifs": {}})
         media_list = []
         count = 0
         user_type_counts = {'images': 0, 'videos': 0, 'gifs': 0}
@@ -969,7 +974,29 @@ async def handle_message(client: Client, message: Message):
     progress_msg = await message.reply("Starting processing...")
     
     for user_idx, user in enumerate(usernames):
-        await process_user(user, title_only, user_idx, total_users, progress_msg, last_edit)
+        retry_count = 0
+        while retry_count < 3:  # Max 3 attempts (initial + 2 retries)
+            await process_user(user, title_only, user_idx, total_users, progress_msg, last_edit)
+            
+            # Check media count for this user
+            async with aiosqlite.connect(TEMP_DB) as db:
+                cursor = await db.execute('SELECT COUNT(*) FROM media WHERE username = ?', (user,))
+                count = (await cursor.fetchone())[0]
+            
+            if count > 0:
+                break
+            
+            retry_count += 1
+            if retry_count < 3:
+                logger.info(f"Retrying user {user}, attempt {retry_count + 1}")
+                # Optional: Update progress message for retry
+                progress = (user_idx / total_users) * 100
+                bar = generate_bar(progress)
+                msg = f"completed {user_idx}/{total_users}\n{bar} {progress:.2f}%\nRetrying {user} (attempt {retry_count + 1})"
+                now = time.time()
+                if now - last_edit[0] > 3:
+                    await progress_msg.edit(msg)
+                    last_edit[0] = now
     
     # Final progress
     progress = 100
