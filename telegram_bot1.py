@@ -855,9 +855,10 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
     bar = generate_bar(progress)
     msg = f"completed {user_idx}/{total_users}\n{bar} {progress:.2f}%\nprocess current username: {user}"
     now = time.time()
-    if now - last_edit[0] > 3:
+    if now - last_edit[0] > 3 and msg != last_edit[1]:
         await progress_msg.edit(msg)
         last_edit[0] = now
+        last_edit[1] = msg
     
     async with aiosqlite.connect(TEMP_DB) as db:
         await db.execute('''CREATE TABLE IF NOT EXISTS media (
@@ -945,9 +946,10 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
     bar = generate_bar(progress)
     msg = f"completed {user_idx+1}/{total_users}\n{bar} {progress:.2f}%\nprocess current username: {user} - completed"
     now = time.time()
-    if now - last_edit[0] > 3:
+    if now - last_edit[0] > 3 and msg != last_edit[1]:
         await progress_msg.edit(msg)
         last_edit[0] = now
+        last_edit[1] = msg
 
 # ───────────────────────────────
 # BOT HANDLER
@@ -968,7 +970,7 @@ async def handle_message(client: Client, message: Message):
         return
     
     total_users = len(usernames)
-    last_edit = [0]
+    last_edit = [0, ""]
     
     # Send initial progress message
     progress_msg = await message.reply("Starting processing...")
@@ -994,15 +996,17 @@ async def handle_message(client: Client, message: Message):
                 bar = generate_bar(progress)
                 msg = f"completed {user_idx}/{total_users}\n{bar} {progress:.2f}%\nRetrying {user} (attempt {retry_count + 1})"
                 now = time.time()
-                if now - last_edit[0] > 3:
+                if now - last_edit[0] > 3 and msg != last_edit[1]:
                     await progress_msg.edit(msg)
                     last_edit[0] = now
+                    last_edit[1] = msg
     
     # Final progress
     progress = 100
     bar = generate_bar(progress)
     msg = f"completed {total_users}/{total_users}\n{bar} {progress:.2f}%\nDeduplicating and generating final gallery..."
-    await progress_msg.edit(msg)
+    if msg != last_edit[1]:
+        await progress_msg.edit(msg)
     
     # Query media from DB
     logger.info("Querying media from database")
