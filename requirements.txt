@@ -1,4 +1,5 @@
 httpx
+httpx[http2]
 aiosqlite
 aioshutil
 selectolax
