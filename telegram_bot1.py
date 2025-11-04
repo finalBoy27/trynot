@@ -33,7 +33,11 @@ def health():
     return {"status": "OK"}
 
 def run_fastapi():
-    uvicorn.run(app, host='0.0.0.0', port=int(os.getenv("PORT", 10000)))
+    port = int(os.getenv("PORT", 10000))
+    try:
+        uvicorn.run(app, host='0.0.0.0', port=port, log_level="error")
+    except Exception as e:
+        logger.error(f"FastAPI error: {e}")
 
 # Disable FastAPI logs if needed, but for now keep
 # logging.getLogger('uvicorn').disabled = True  # optional
@@ -344,8 +348,15 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
                         logger.warning(f"Skipping invalid URL for {username}: {item}")
                         continue
                     try:
-                        # Ensure URL is properly escaped
-                        safe_src = html.escape(item).replace('"', '\\"').replace('\n', '')
+                        # Clean URL - remove any encoding artifacts
+                        clean_url = item.strip()
+                        if clean_url.startswith('%22') and clean_url.endswith('%22'):
+                            clean_url = clean_url[3:-3]
+                        if clean_url.startswith('"') and clean_url.endswith('"'):
+                            clean_url = clean_url[1:-1]
+                        
+                        # Ensure URL is properly escaped for JSON
+                        safe_src = clean_url.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '').replace('\r', '')
                         media_list.append({
                             'type': media_type,
                             'src': safe_src,
@@ -368,17 +379,21 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
         logger.warning(f"No media items found for {usernames_str}")
         return None
 
-    # Check HTML size to prevent truncation
-    estimated_size = sum(len(str(item)) for user_items in media_data.values() for item in user_items) / (1024 * 1024)
-    if estimated_size > MAX_FILE_SIZE_MB:
-        logger.warning(f"Estimated HTML size {estimated_size:.2f} MB exceeds limit of {MAX_FILE_SIZE_MB} MB")
-        return None
+    logger.info(f"Total media items to include in HTML: {total_items}")
 
     # Serialize mediaData to JSON to ensure valid structure
     try:
-        media_data_json = json.dumps(media_data, ensure_ascii=False, indent=2)
+        media_data_json = json.dumps(media_data, ensure_ascii=False, indent=None)  # No indent to save space
+        json_size_mb = len(media_data_json) / (1024 * 1024)
+        logger.info(f"Media data JSON size: {json_size_mb:.2f} MB")
+        
+        if json_size_mb > MAX_FILE_SIZE_MB:
+            logger.error(f"Media data JSON size {json_size_mb:.2f} MB exceeds limit of {MAX_FILE_SIZE_MB} MB")
+            return None
     except Exception as e:
         logger.error(f"Failed to serialize mediaData to JSON: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
         return None
 
     # Compute year counts
@@ -910,6 +925,16 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
                         media_urls = extract_media_from_html(html_data)
                         media_urls = filter_media(media_urls, set())  # local dedup per page
                         for url in media_urls:
+                            # Clean URL before storing
+                            url = url.strip()
+                            if url.startswith('%22') and url.endswith('%22'):
+                                url = url[3:-3]
+                            if url.startswith('"') and url.endswith('"'):
+                                url = url[1:-1]
+                            
+                            if not url.startswith(('http://', 'https://')):
+                                continue
+                            
                             if 'vh/dl?url' in url:
                                 typ = 'videos'
                             elif 'vh/dli?' in url:
@@ -1009,37 +1034,77 @@ async def handle_message(client: Client, message: Message):
     # Final progress
     progress = 100
     bar = generate_bar(progress)
-    msg = f"completed {total_users}/{total_users}\n{bar} {progress:.2f}%\nDeduplicating and generating final gallery..."
+    msg = f"completed {total_users}/{total_users}\n{bar} {progress:.2f}%\nQuerying database and preparing HTML..."
     if msg != last_edit[1]:
         await progress_msg.edit(msg)
+        last_edit[0] = time.time()
+        last_edit[1] = msg
     
-    # Query media from DB
+    # Query media from DB in batches to avoid memory overflow
     logger.info("Querying media from database")
     log_memory()
-    async with aiosqlite.connect(TEMP_DB) as db:
-        cursor = await db.execute('SELECT username, post_date, media_url, media_type FROM media')
-        rows = await cursor.fetchall()
     
-    logger.info(f"Retrieved {len(rows)} media items from database")
-    log_memory()
-    
-    # Build media_by_date_per_username
+    # Build media_by_date_per_username by processing in batches
     media_by_date_per_username = {}
-    for row in rows:
-        user, date, url, typ = row
-        if user not in media_by_date_per_username:
-            media_by_date_per_username[user] = {"images": {}, "videos": {}, "gifs": {}}
-        if date not in media_by_date_per_username[user][typ]:
-            media_by_date_per_username[user][typ][date] = []
-        media_by_date_per_username[user][typ][date].append(url)
+    async with aiosqlite.connect(TEMP_DB) as db:
+        # Get total count first
+        cursor = await db.execute('SELECT COUNT(*) FROM media')
+        total_count = (await cursor.fetchone())[0]
+        logger.info(f"Total media items in database: {total_count}")
+        
+        # Process in batches of 10000
+        batch_size = 10000
+        offset = 0
+        while offset < total_count:
+            cursor = await db.execute('SELECT username, post_date, media_url, media_type FROM media LIMIT ? OFFSET ?', (batch_size, offset))
+            rows = await cursor.fetchall()
+            
+            for row in rows:
+                user, date, url, typ = row
+                # Clean and validate URL
+                url = url.strip()
+                # Remove URL encoding artifacts
+                if url.startswith('%22') and url.endswith('%22'):
+                    url = url[3:-3]
+                if url.startswith('"') and url.endswith('"'):
+                    url = url[1:-1]
+                
+                # Skip invalid URLs
+                if not url.startswith(('http://', 'https://')):
+                    logger.warning(f"Skipping invalid URL for {user}: {url}")
+                    continue
+                
+                if user not in media_by_date_per_username:
+                    media_by_date_per_username[user] = {"images": {}, "videos": {}, "gifs": {}}
+                if date not in media_by_date_per_username[user][typ]:
+                    media_by_date_per_username[user][typ][date] = []
+                media_by_date_per_username[user][typ][date].append(url)
+            
+            offset += batch_size
+            logger.info(f"Processed {min(offset, total_count)}/{total_count} media items")
+            
+            # Clean up batch
+            del rows
+            gc.collect()
     
-    # Clean up rows to free memory
-    del rows
-    gc.collect()
     log_memory()
+    
+    # Update progress before HTML generation
+    msg = f"completed {total_users}/{total_users}\n{bar} {progress:.2f}%\nGenerating HTML file..."
+    now = time.time()
+    if now - last_edit[0] > 3 and msg != last_edit[1]:
+        await progress_msg.edit(msg)
+        last_edit[0] = now
+        last_edit[1] = msg
     
     # Generate HTML
-    html_content = create_html(media_by_date_per_username, usernames, 2019, 2025)
+    try:
+        html_content = create_html(media_by_date_per_username, usernames, 2019, 2025)
+    except Exception as html_error:
+        logger.error(f"HTML generation error: {str(html_error)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        html_content = None
     
     total_items = sum(len(media_list) for user_media in media_by_date_per_username.values() for media_type in user_media.values() for media_list in media_type.values())
     
@@ -1049,37 +1114,58 @@ async def handle_message(client: Client, message: Message):
     log_memory()
     
     if html_content:
-        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-            f.write(html_content)
-        
-        # Upload
-        with open(OUTPUT_FILE, "rb") as f:
-            data = f.read()
-        async with httpx.AsyncClient() as client:
-            tasks = [upload_file(client, h, data) for h in HOSTS]
-            results = await asyncio.gather(*tasks)
-        
-        links = []
-        for name, res in results:
-            status = "✅" if res.startswith("https://") else "❌"
-            links.append(f"{status} {name}: {res}")
-        
-        caption = f"Total Media in Html: {total_items}\n───────────────────────────────────\n📤 Uploading Final HTML to Hosting Services\n" + "\n".join(links)
-        
-        await message.reply_document(OUTPUT_FILE, caption=caption)
-        
-        # Delete progress message after sending the final gallery
-        await progress_msg.delete()
-        
-        # Clean up
         try:
-            if os.path.exists(TEMP_DB):
-                await asyncio.to_thread(os.remove, TEMP_DB)
-            await aioshutil.rmtree("Scraping")
-        except Exception as e:
-            logger.error(f"Cleanup error: {e}")
+            # Save HTML file
+            with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+                f.write(html_content)
+            logger.info(f"HTML file saved: {OUTPUT_FILE}")
+            
+            # Clean up html_content from memory
+            del html_content
+            gc.collect()
+            log_memory()
+            
+            # Upload
+            with open(OUTPUT_FILE, "rb") as f:
+                data = f.read()
+            
+            logger.info(f"Starting upload, file size: {len(data) / (1024*1024):.2f} MB")
+            async with httpx.AsyncClient() as client:
+                tasks = [upload_file(client, h, data) for h in HOSTS]
+                results = await asyncio.gather(*tasks)
+            
+            links = []
+            for name, res in results:
+                status = "✅" if res.startswith("https://") else "❌"
+                links.append(f"{status} {name}: {res}")
+            
+            caption = f"Total Media in Html: {total_items}\n───────────────────────────────────\n📤 Uploading Final HTML to Hosting Services\n" + "\n".join(links)
+            
+            logger.info("Sending document to user")
+            await message.reply_document(OUTPUT_FILE, caption=caption)
+            logger.info("Document sent successfully")
+            
+            # Delete progress message after sending the final gallery
+            await progress_msg.delete()
+            
+            # Clean up
+            try:
+                if os.path.exists(TEMP_DB):
+                    await asyncio.to_thread(os.remove, TEMP_DB)
+                if os.path.exists("Scraping"):
+                    await aioshutil.rmtree("Scraping")
+                logger.info("Cleanup completed")
+            except Exception as e:
+                logger.error(f"Cleanup error: {e}")
+        except Exception as send_error:
+            logger.error(f"Error sending output: {str(send_error)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            await message.reply(f"Error sending output: {str(send_error)}\nCheck logs for details.")
     else:
-        await message.reply("Failed to generate HTML")
+        error_msg = "Failed to generate HTML. Check logs for details."
+        logger.error(error_msg)
+        await message.reply(error_msg)
 
 # ───────────────────────────────
 # MAIN
