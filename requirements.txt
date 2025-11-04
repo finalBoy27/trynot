@@ -4,10 +4,10 @@ aioshutil
 selectolax
 pyrogram
 tgcrypto
-rich
 aiofiles
 psutil
 regex
 loguru
 fastapi
 uvicorn
+orjson
