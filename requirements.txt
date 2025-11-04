@@ -1,4 +1,3 @@
-httpx
 httpx[http2]
 aiosqlite
 aioshutil
@@ -10,5 +9,5 @@ psutil
 regex
 loguru
 fastapi
-uvicorn
+uvicorn[standard]
 orjson
