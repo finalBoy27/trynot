@@ -8,7 +8,6 @@ import html
 import math
 import gc
 import logging
-import aioshutil
 from urllib.parse import urlencode, urljoin
 from selectolax.parser import HTMLParser
 from datetime import datetime
@@ -20,6 +19,8 @@ from fastapi import FastAPI
 import uvicorn
 import threading
 import aiosqlite
+from collections import defaultdict
+import orjson  # Faster JSON library
 
 # Health check app
 app = FastAPI()
@@ -55,7 +56,7 @@ OLDER_THAN = "2025"
 TIMEOUT = [5.0, 10.0, 15.0]
 DELAY_BETWEEN_REQUESTS = 0.3
 TEMP_DB = "Scraping/tempMedia.db"
-MAX_CONCURRENT_WORKERS = 8  # Reduced for memory
+MAX_CONCURRENT_WORKERS = 12  # Optimized for better performance
 MAX_RETRIES = 3
 RETRY_DELAY = [1.0, 1.5, 2.0]
 
@@ -250,7 +251,9 @@ async def process_thread(client: httpx.AsyncClient, post_url, patterns, semaphor
 
 async def process_threads_concurrent(thread_urls, patterns):
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
-    async with httpx.AsyncClient() as client:
+    # Optimized client with connection pooling
+    limits = httpx.Limits(max_keepalive_connections=20, max_connections=100)
+    async with httpx.AsyncClient(limits=limits, http2=True) as client:
         tasks = [process_thread(client, url, patterns, semaphore) for url in thread_urls]
         results = await asyncio.gather(*tasks)
     return [item for sublist in results for item in sublist]
@@ -383,7 +386,8 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
 
     # Serialize mediaData to JSON to ensure valid structure
     try:
-        media_data_json = json.dumps(media_data, ensure_ascii=False, indent=None)  # No indent to save space
+        # Use orjson for faster and more efficient JSON serialization
+        media_data_json = orjson.dumps(media_data).decode('utf-8')
         json_size_mb = len(media_data_json) / (1024 * 1024)
         logger.info(f"Media data JSON size: {json_size_mb:.2f} MB")
         
@@ -404,7 +408,7 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
             if year not in year_counts:
                 year_counts[year] = 0
             year_counts[year] += 1
-    year_counts_json = json.dumps(year_counts)
+    year_counts_json = orjson.dumps(year_counts).decode('utf-8')
 
     # Calculate default itemsPerPage
     default_items_per_page = max(1, math.ceil(total_items / MAX_PAGINATION_RANGE))
@@ -481,7 +485,7 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
   <div class="masonry" id="masonry"></div>
   <script>
     const mediaData = {media_data_json};
-    const usernames = {json.dumps([username.replace(' ', '_') for username in usernames])};
+    const usernames = {orjson.dumps([username.replace(' ', '_') for username in usernames]).decode('utf-8')};
     const yearCounts = {year_counts_json};
     const masonry = document.getElementById("masonry");
     const pagination = document.getElementById("pagination");
@@ -885,13 +889,19 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
             media_url TEXT UNIQUE,
             media_type TEXT
         )''')
+        # Create indexes for faster queries
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_username ON media(username)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_date ON media(post_date)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_type ON media(media_type)')
         await db.commit()
         
         start_url = build_search_url(INITIAL_SEARCH_ID, search_display, NEWER_THAN, OLDER_THAN, title_only=title_only)
         batch_num = 1
         current_url = start_url
         
-        async with httpx.AsyncClient() as client:
+        # Optimized HTTP client with connection pooling and HTTP/2
+        limits = httpx.Limits(max_keepalive_connections=20, max_connections=50)
+        async with httpx.AsyncClient(limits=limits, http2=True) as client:
             while current_url:
                 resp = await fetch_page(client, current_url)
                 if not resp["ok"]:
@@ -1045,7 +1055,7 @@ async def handle_message(client: Client, message: Message):
     log_memory()
     
     # Build media_by_date_per_username by processing in batches
-    media_by_date_per_username = {}
+    media_by_date_per_username = defaultdict(lambda: {"images": {}, "videos": {}, "gifs": {}})
     async with aiosqlite.connect(TEMP_DB) as db:
         # Get total count first
         cursor = await db.execute('SELECT COUNT(*) FROM media')
@@ -1071,11 +1081,8 @@ async def handle_message(client: Client, message: Message):
                 
                 # Skip invalid URLs
                 if not url.startswith(('http://', 'https://')):
-                    logger.warning(f"Skipping invalid URL for {user}: {url}")
                     continue
                 
-                if user not in media_by_date_per_username:
-                    media_by_date_per_username[user] = {"images": {}, "videos": {}, "gifs": {}}
                 if date not in media_by_date_per_username[user][typ]:
                     media_by_date_per_username[user][typ][date] = []
                 media_by_date_per_username[user][typ][date].append(url)
@@ -1153,7 +1160,8 @@ async def handle_message(client: Client, message: Message):
                 if os.path.exists(TEMP_DB):
                     await asyncio.to_thread(os.remove, TEMP_DB)
                 if os.path.exists("Scraping"):
-                    await aioshutil.rmtree("Scraping")
+                    import shutil
+                    await asyncio.to_thread(shutil.rmtree, "Scraping")
                 logger.info("Cleanup completed")
             except Exception as e:
                 logger.error(f"Cleanup error: {e}")
