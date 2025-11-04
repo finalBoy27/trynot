@@ -11,3 +11,4 @@ loguru
 fastapi
 uvicorn[standard]
 orjson
+httpx
